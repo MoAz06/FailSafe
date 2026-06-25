@@ -360,6 +360,8 @@ def collect_py(args, targets, value_flags):
             continue
         if "/" in a or "\\" in a or "://" in a:
             continue
+        if "<" in a or ">" in a:
+            continue  # shell redirect token (e.g. 2>&1 split by shlex)
         if re.search(r"\.(txt|cfg|toml|ini|whl|zip)$", a, re.I) or a.endswith(".tar.gz"):
             continue
         name = strip_py_version(a)

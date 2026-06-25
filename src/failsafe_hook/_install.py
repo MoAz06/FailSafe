@@ -3,6 +3,7 @@
 FailSafe installer logic.
 
 Invoked via:
+  python -m failsafe_hook
   python -m failsafe_hook --install
   python -m failsafe_hook --uninstall
   python -m failsafe_hook --check
@@ -56,8 +57,8 @@ def install():
     except Exception:
         print("ERROR: failsafe_hook package is not installed.")
         print("Install it first:")
-        print("  pip install -e .       (from repo root, for development)")
-        print("  pip install failsafe-hook  (from PyPI)")
+        print("  python -m pip install -e .       (from repo root, for development)")
+        print("  python -m pip install failsafe-hook  (from PyPI)")
         sys.exit(1)
 
     sp = _settings_path()
@@ -143,7 +144,7 @@ def check():
     else:
         print("Status: NOT INSTALLED")
         print(f"  settings : {sp}")
-        print("Run:  python -m failsafe_hook --install")
+        print("Run:  python -m failsafe_hook")
 
 
 def main():

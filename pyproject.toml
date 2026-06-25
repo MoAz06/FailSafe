@@ -11,6 +11,9 @@ requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [{name = "Mohamed Azahrioui", email = "mohamedazahrioui2006@gmail.com"}]
 
+[project.scripts]
+failsafe = "failsafe_hook.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/MoAz06/FailSafe"
 "Bug Tracker" = "https://github.com/MoAz06/FailSafe/issues"

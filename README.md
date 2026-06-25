@@ -10,12 +10,32 @@ FailSafe runs as a `PreToolUse` hook. **A hook deny still fires in bypass mode.*
 
 ## Install
 
-**From PyPI:**
+Install the package from PyPI:
 
 ```bash
-pip install failsafe-hook
-python -m failsafe_hook --install
+python -m pip install failsafe-hook
 ```
+
+Or install it from GitHub:
+
+```bash
+python -m pip install "git+https://github.com/MoAz06/FailSafe.git"
+```
+
+Then wire FailSafe into Claude Code:
+
+```bash
+python -m failsafe_hook
+```
+
+If your Python Scripts directory is on PATH, this shortcut also works:
+
+```bash
+failsafe
+```
+
+If Windows says `failsafe` is not found, use `python -m failsafe_hook`. That
+always works.
 
 **From source:**
 
