@@ -874,6 +874,8 @@ def _git_push_branch(subargs):
     # non_flag: [remote, refspec, ...]  refspec may be src:dst or branch
     for token in non_flag[1:]:
         dst = token.split(":")[-1].lstrip("+")
+        if dst.startswith("refs/heads/"):
+            dst = dst[len("refs/heads/"):]
         if dst:
             return dst
     return None
@@ -933,7 +935,9 @@ def check_git_disaster(command, _depth=0):
         if subcmd == "push":
             force_flags = [a for a in subargs if a in _GIT_FORCE_FLAGS
                            or a.startswith("--force-with-lease=")]
-            if force_flags:
+            plus_refspecs = [a for a in subargs
+                             if not a.startswith("-") and a.startswith("+")]
+            if force_flags or plus_refspecs:
                 branch = _git_push_branch(subargs)
                 if branch and branch.lower() in _GIT_PROTECTED_BRANCHES:
                     return ("deny",
@@ -1046,7 +1050,7 @@ def check_cloud_infra(command, _depth=0):
 
 _SENSITIVE_RE = [
     re.compile(r"(^|[\\/])\.env(\.[a-zA-Z]+)?$"),
-    re.compile(r"(^|[\\/])\.ssh[\\/]"),
+    re.compile(r"(^|[\\/])\.ssh([\\/]|$)"),
     re.compile(r"\.(pem|key|p12|pfx|crt|cer|jks)$", re.I),
     re.compile(r"(^|[\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(\.pub)?$"),
     re.compile(r"(^|[\\/])(\.netrc|\.npmrc|\.pypirc)$"),
@@ -1134,6 +1138,27 @@ def check_secrets_exfil(command, _depth=0):
                 "A sensitive file (%s) is being sent to a remote server. "
                 "Confirm this is intentional." % (" ".join(toks), f))
 
+    # Pattern 3a: tar <flags> <sensitive> | <network_cmd>
+    for i, (_, seg) in enumerate(segs):
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] != "tar":
+            continue
+        sensitive = [a for a in seg_s[1:]
+                     if a != "-" and not a.startswith("-") and _is_sensitive(a)]
+        if not sensitive:
+            continue
+        for j in range(i + 1, len(segs)):
+            jop, jseg = segs[j]
+            if jop != "|":
+                break
+            jseg_s = strip_prefix(jseg)
+            if jseg_s and jseg_s[0] in _NETWORK_SENDERS:
+                return ("ask",
+                    "FailSafe flagged a possible secrets leak:\n\n"
+                    "  %s\n\n"
+                    "Sensitive files (%s) are being archived and piped to a network command. "
+                    "Confirm this is intentional." % (" ".join(toks), sensitive[0]))
+
     # Pattern 3: scp/rsync <sensitive> <remote:path>
     for _, seg in segs:
         seg_s = strip_prefix(seg)
@@ -1147,6 +1172,24 @@ def check_secrets_exfil(command, _depth=0):
                     "FailSafe flagged a possible secrets leak:\n\n"
                     "  %s\n\n"
                     "A sensitive file (%s) is being copied to a remote destination. "
+                    "Confirm this is intentional." % (" ".join(toks), src))
+
+    # Pattern 4: aws s3 cp/mv <sensitive> s3://...
+    for _, seg in segs:
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] != "aws":
+            continue
+        rest = seg_s[1:]
+        if len(rest) < 2 or rest[0] != "s3" or rest[1] not in ("cp", "mv"):
+            continue
+        non_flags = [a for a in rest[2:] if not a.startswith("-")]
+        if len(non_flags) >= 2:
+            src, dst = non_flags[0], non_flags[-1]
+            if dst.startswith("s3://") and _is_sensitive(src):
+                return ("ask",
+                    "FailSafe flagged a possible secrets leak:\n\n"
+                    "  %s\n\n"
+                    "A sensitive file (%s) is being uploaded to S3. "
                     "Confirm this is intentional." % (" ".join(toks), src))
 
     if _depth < 2:
