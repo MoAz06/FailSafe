@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for Cargo crate parsing (module 9 — ecosystem expansion)."""
+"""Tests for Cargo crate parsing (module 9 -- ecosystem expansion)."""
 import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from failsafe import parse_install_targets, collect_cargo, CARGO_NAME_RE

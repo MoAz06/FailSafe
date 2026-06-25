@@ -33,7 +33,7 @@ def check(label, got, expected):
             print(f"       expected={expected!r}  got={got!r}")
 
 
-# ── _parse_package_lock ───────────────────────────────────────────────────────
+# --- _parse_package_lock ---
 
 LOCK_V2 = json.dumps({
     "lockfileVersion": 2,
@@ -62,7 +62,7 @@ check("package-lock: invalid json -> []",
     _parse_package_lock("not json"),
     [])
 
-# ── _parse_yarn_lock ──────────────────────────────────────────────────────────
+# --- _parse_yarn_lock ---
 
 YARN_V1 = """\
 # yarn lockfile v1
@@ -91,7 +91,7 @@ check("yarn.lock: empty -> []",
     _parse_yarn_lock(""),
     [])
 
-# ── _parse_poetry_lock ────────────────────────────────────────────────────────
+# --- _parse_poetry_lock ---
 
 try:
     import tomllib
@@ -127,7 +127,7 @@ if HAS_TOMLLIB:
 else:
     print("SKIP  poetry.lock tests (Python < 3.11, no tomllib)")
 
-# ── parse_manifest_targets: npm ci -> package-lock.json ──────────────────────
+# --- parse_manifest_targets: npm ci -> package-lock.json ---
 
 with tempfile.TemporaryDirectory() as tmp:
     lock = {
@@ -148,7 +148,7 @@ with tempfile.TemporaryDirectory() as tmp:
     r = parse_manifest_targets("npm ci", tmp)
     check("npm ci no lockfile -> []", r, [])
 
-# ── parse_manifest_targets: yarn install -> yarn.lock ────────────────────────
+# --- parse_manifest_targets: yarn install -> yarn.lock ---
 
 with tempfile.TemporaryDirectory() as tmp:
     with open(os.path.join(tmp, "package.json"), "w") as f:
@@ -160,7 +160,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("yarn install includes yarn.lock packages",
         "fake-yarn-pkg" in names, True)
 
-# ── parse_manifest_targets: poetry install -> poetry.lock ────────────────────
+# --- parse_manifest_targets: poetry install -> poetry.lock ---
 
 if HAS_TOMLLIB:
     with tempfile.TemporaryDirectory() as tmp:

@@ -34,7 +34,7 @@ def _reload_with_config(toml_text, cwd):
         os.chdir(orig_cwd)
 
 
-# ── protected_branches ────────────────────────────────────────────────────────
+# --- protected_branches ---
 
 with tempfile.TemporaryDirectory() as tmp:
     with open(os.path.join(tmp, "failsafe.toml"), "w") as f:
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as tmp:
     r = fs.check_git_disaster("git push origin main --force")
     check("'main' not in custom list -> ask", r[0] if r else None, "ask")
 
-# ── allowed_packages ─────────────────────────────────────────────────────────
+# --- allowed_packages ---
 
 with tempfile.TemporaryDirectory() as tmp:
     with open(os.path.join(tmp, "failsafe.toml"), "w") as f:
@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory() as tmp:
     r = fs.evaluate(("pypi", "my-private-pkg"))
     check("allowed_packages pypi skip -> allow", r[0], "allow")
 
-# ── strict mode ───────────────────────────────────────────────────────────────
+# --- strict mode ---
 
 with tempfile.TemporaryDirectory() as tmp:
     with open(os.path.join(tmp, "failsafe.toml"), "w") as f:
@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory() as tmp:
     r = fs._strict(("ask", "some reason"))
     check("strict=false: ask stays ask", r[0], "ask")
 
-# ── no config -> defaults intact ─────────────────────────────────────────────
+# --- no config -> defaults intact ---
 
 with tempfile.TemporaryDirectory() as tmp:
     fs = _reload_with_config("", tmp)
