@@ -16,7 +16,7 @@ FailSafe runs as a `PreToolUse` hook. A hook deny still fires in bypass mode. Th
 | :-- | :-- |
 | Package **does not exist** on npm / PyPI | Deny - almost always a hallucination |
 | Exists, but **one edit away** from a popular package (e.g. `expres` vs `express`, `loadsh` vs `lodash`) | Ask - possible typosquat or look-alike |
-| npm package exists, but was **published < 90 days ago** with **< 100 downloads/month** | Ask - suspiciously fresh |
+| Package exists, but was **published < 90 days ago** with **< 100 downloads/month** | Ask - suspiciously fresh |
 | Everything else | Allow (silent, no slowdown) |
 
 **Destructive commands (module 2)**
@@ -33,6 +33,20 @@ FailSafe runs as a `PreToolUse` hook. A hook deny still fires in bypass mode. Th
 | `npx`, `npm exec`, `npm x`, `pnpm dlx`, `bunx`, `bun x`, or `yarn dlx` runs a package that does not exist on npm | Deny |
 | Runner target is one edit away from a popular package, or is suspiciously fresh/low-download | Ask |
 | Local paths such as `npx ./scripts/tool.js` | Allow |
+
+**Manifest installs (module 4)**
+
+A bare install pulls every dependency declared in a manifest file. FailSafe reads the manifest and runs the same registry checks on each declared package, so a hallucinated dep hidden in a file is caught just like a direct argument.
+
+| Situation | Action |
+| :-- | :-- |
+| `npm/pnpm/yarn/bun install` (no package arg) reads `package.json` and a dep does not exist | Deny |
+| `pip install -r <file>`, `uv pip install -r <file>` reads the requirements file and a dep does not exist | Deny |
+| `poetry install` / `uv sync` reads `pyproject.toml` and a dep does not exist | Deny |
+| A declared dep is a look-alike or suspiciously fresh | Ask |
+| Local/git/url/workspace specs in the manifest | Ignored |
+
+Only source manifests are parsed (`package.json`, `requirements.txt`, `pyproject.toml`). Generated lockfiles and YAML lockfiles are not. `pyproject.toml` parsing requires Python 3.11+ (`tomllib`); on older Python it fails open.
 
 More rules are coming.
 
@@ -80,10 +94,16 @@ FailSafe inspects packages passed as **direct arguments** to install commands an
 
 It handles quoted names, shell operators such as `;` and `&&`, `env FOO=bar`
 prefixes, common wrapper flags (`sudo -n`, `env -i`, `time -p`), and `bash -c "..."`
-inner commands. Local paths, git URLs, `.tgz`/`.whl`, and lockfile installs (`npm ci`) are ignored.
+inner commands. Local paths, git URLs, and `.tgz`/`.whl` are ignored.
+
+It also reads source manifests on bare installs (see module 4): `package.json`
+for `npm/pnpm/yarn/bun install` and `npm ci`, the requirements file for
+`pip install -r` / `uv pip install -r`, and `pyproject.toml` for `poetry install`
+/ `uv sync`.
 
 **Not yet inspected:**
-- Manifest installs: bare `npm install`, `pip install -r`, `poetry install`, `uv sync`.
+- Lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `poetry.lock`, `uv.lock`).
+- `pyproject.toml` on Python < 3.11 (no `tomllib`).
 - Runner command strings that hide the package inside a shell snippet, such as `npm exec -c "eslint --fix ."`.
 
 ## How it works
@@ -98,9 +118,9 @@ PreToolUse hook  ->  parse the Bash command for install / runner intents
 
 ## Limitations
 
-- Direct arguments only. Manifest installs and deeply embedded runner command strings are not inspected yet.
+- Direct arguments and source manifests are inspected; generated lockfiles and deeply embedded runner command strings are not.
 - npm and PyPI only today. Cargo, Go modules, RubyGems, Maven are next.
-- PyPI checks cover existence and look-alikes. npm also gets package age and monthly download checks.
+- npm and PyPI checks cover existence, look-alikes, package age, and monthly download counts. PyPI download data comes from pypistats.org.
 - The look-alike list is a small curated set of popular packages.
 - Existence check trusts the registry. It does not score package reputation the way Socket/Snyk do - it is a free, zero-config first line of defense, not a full SCA.
 

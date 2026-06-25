@@ -12,6 +12,9 @@ Current rules:
   2. Destructive rm - blocks rm -rf on root, home, and system dirs.
   3. One-off runner defense - checks npx/npm exec/pnpm dlx/bunx targets
      before the agent executes registry code.
+  4. Manifest install defense - reads package.json/requirements.txt/
+     pyproject.toml on bare installs so a hallucinated dep hidden in a
+     manifest is caught too.
 
 Design rules:
   - FAIL OPEN. Any unexpected error -> allow. A guard that breaks your
@@ -24,6 +27,7 @@ Stdlib only -> zero install. Works wherever Python 3.8+ is present.
 """
 
 import json
+import os
 import re
 import shlex
 import sys
@@ -109,7 +113,7 @@ PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --------------------------------------------------------------- HTTP
 def http_get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.4"})
+    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.5"})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             status = getattr(r, "status", 200)
@@ -360,6 +364,236 @@ def parse_install_targets(command, _depth=0):
     return targets
 
 
+# ----------------------------------------- manifest install check
+#
+# Threat model: an agent invents a package name, writes it into a manifest
+# (requirements.txt, package.json, pyproject.toml), then runs a *bare* install
+# such as `npm install` or `pip install -r requirements.txt`. The direct-arg
+# parser above never sees the package because it lives in a file. Here we read
+# the relevant source manifest and feed its declared packages through the same
+# registry checks.
+#
+# Source manifests only -- generated lockfiles (package-lock.json,
+# pnpm-lock.yaml, yarn.lock) are not parsed: an agent is unlikely to hand-edit
+# them, and YAML has no stdlib parser. pyproject.toml needs tomllib (Python
+# 3.11+); on older Python we fail open rather than guess at TOML.
+
+MAX_MANIFEST_BYTES = 512 * 1024  # don't slurp a giant generated file
+
+# npm bare-install verbs (no positional package => install from package.json)
+JS_INSTALL_VERBS = {
+    "npm": {"install", "i", "ci"},
+    "pnpm": {"install", "i"},
+    "yarn": {"install"},
+    "bun": {"install", "i"},
+}
+
+# package.json spec values that point at something other than a registry name
+_JS_SKIP_SPEC_PREFIXES = (
+    "file:", "link:", "portal:", "workspace:", "git+", "git:",
+    "github:", "gitlab:", "bitbucket:", "http:", "https:",
+)
+
+
+def _read_text(path):
+    try:
+        if os.path.getsize(path) > MAX_MANIFEST_BYTES:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _abs(path, cwd):
+    return path if os.path.isabs(path) else os.path.join(cwd, path)
+
+
+def _parse_package_json(text):
+    targets = []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return targets
+    if not isinstance(data, dict):
+        return targets
+    for key in ("dependencies", "devDependencies",
+                "optionalDependencies", "peerDependencies"):
+        section = data.get(key)
+        if not isinstance(section, dict):
+            continue
+        for name, spec in section.items():
+            if not isinstance(name, str):
+                continue
+            if isinstance(spec, str) and spec.lower().startswith(_JS_SKIP_SPEC_PREFIXES):
+                continue  # local path, git, url, or workspace alias
+            if NPM_NAME_RE.match(name):
+                targets.append(("npm", name))
+    return targets
+
+
+def _parse_requirements(text):
+    targets = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if " #" in line:  # strip trailing inline comment
+            line = line.split(" #", 1)[0].strip()
+        if line.startswith("-"):
+            continue  # -r/-c includes, -e editable, --hash, other options
+        if "://" in line or line.startswith("git+") or " @ " in line:
+            continue  # url / direct reference
+        if "/" in line or "\\" in line:
+            continue  # local path
+        name = strip_py_version(line).strip()
+        if name and PY_NAME_RE.match(name):
+            targets.append(("pypi", name))
+    return targets
+
+
+def _pep508_name(dep):
+    if not isinstance(dep, str):
+        return None
+    name = strip_py_version(dep).strip()
+    return name if name and PY_NAME_RE.match(name) else None
+
+
+def _parse_pyproject(text):
+    targets = []
+    try:
+        import tomllib
+    except ImportError:
+        return targets  # Python < 3.11: fail open
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        return targets
+    if not isinstance(data, dict):
+        return targets
+
+    # PEP 621: [project] dependencies + optional-dependencies
+    project = data.get("project") or {}
+    if isinstance(project, dict):
+        for dep in project.get("dependencies") or []:
+            name = _pep508_name(dep)
+            if name:
+                targets.append(("pypi", name))
+        opt = project.get("optional-dependencies") or {}
+        if isinstance(opt, dict):
+            for group in opt.values():
+                for dep in group or []:
+                    name = _pep508_name(dep)
+                    if name:
+                        targets.append(("pypi", name))
+
+    # Poetry: [tool.poetry.dependencies] (table: name = version)
+    poetry = ((data.get("tool") or {}).get("poetry") or {})
+    if isinstance(poetry, dict):
+        tables = [poetry.get("dependencies"), poetry.get("dev-dependencies")]
+        groups = poetry.get("group") or {}
+        if isinstance(groups, dict):
+            for g in groups.values():
+                if isinstance(g, dict):
+                    tables.append(g.get("dependencies"))
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            for name in table:
+                if not isinstance(name, str) or name.lower() == "python":
+                    continue
+                if PY_NAME_RE.match(name):
+                    targets.append(("pypi", name))
+    return targets
+
+
+def _npm_prefix_dir(args, cwd):
+    """Honor --prefix DIR / -C DIR so we read the right package.json."""
+    for i, a in enumerate(args):
+        if a in ("--prefix", "-C", "--cwd") and i + 1 < len(args):
+            return _abs(args[i + 1], cwd)
+        for flag in ("--prefix=", "-C=", "--cwd="):
+            if a.startswith(flag):
+                return _abs(a[len(flag):], cwd)
+    return cwd
+
+
+def _requirement_files(args, cwd):
+    files, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-r", "--requirement", "-c", "--constraint"):
+            if i + 1 < len(args):
+                files.append(_abs(args[i + 1], cwd))
+                i += 2
+                continue
+        elif a.startswith("--requirement=") or a.startswith("--constraint="):
+            files.append(_abs(a.split("=", 1)[1], cwd))
+        elif a.startswith("-r") and len(a) > 2:
+            files.append(_abs(a[2:], cwd))
+        elif a.startswith("-c") and len(a) > 2:
+            files.append(_abs(a[2:], cwd))
+        i += 1
+    return files
+
+
+def _manifest_file(path, parser):
+    text = _read_text(path)
+    return parser(text) if text else []
+
+
+def parse_manifest_targets(command, cwd, _depth=0):
+    """Collect packages declared in a manifest that a bare install would pull."""
+    if not cwd:
+        cwd = os.getcwd()
+    toks = tokenize(command)
+    out = []
+    for tokens in split_segments(toks):
+        tokens = strip_prefix(tokens)
+        if not tokens:
+            continue
+        mgr, rest = tokens[0], tokens[1:]
+
+        if mgr in SHELLS and _depth < 2:
+            for t in rest:
+                if " " in t:
+                    out.extend(parse_manifest_targets(t, cwd, _depth + 1))
+            continue
+
+        if mgr in ("python", "python3") and len(rest) >= 2 and rest[0] == "-m" and rest[1] == "pip":
+            mgr, rest = "pip", rest[2:]
+
+        # JS bare install -> read package.json (only when no direct package arg)
+        if mgr in JS_MANAGERS:
+            is_install = (not rest and mgr == "yarn") or (rest and rest[0] in JS_INSTALL_VERBS[mgr])
+            if is_install:
+                direct = []
+                collect_js(rest[1:] if rest else [], direct, NPM_VALUE_FLAGS)
+                if not direct:  # direct args are handled by parse_install_targets
+                    pkg_dir = _npm_prefix_dir(rest[1:] if rest else [], cwd)
+                    out += _manifest_file(os.path.join(pkg_dir, "package.json"), _parse_package_json)
+            continue
+
+        if mgr in ("pip", "pip3") and rest and rest[0] == "install":
+            for fp in _requirement_files(rest[1:], cwd):
+                out += _manifest_file(fp, _parse_requirements)
+            continue
+
+        if mgr == "uv":
+            if rest and rest[0] == "sync":
+                out += _manifest_file(os.path.join(cwd, "pyproject.toml"), _parse_pyproject)
+            elif len(rest) >= 2 and rest[0] == "pip" and rest[1] == "install":
+                for fp in _requirement_files(rest[2:], cwd):
+                    out += _manifest_file(fp, _parse_requirements)
+            continue
+
+        if mgr == "poetry" and rest and rest[0] == "install":
+            out += _manifest_file(os.path.join(cwd, "pyproject.toml"), _parse_pyproject)
+            continue
+
+    return out
+
+
 # ---------------------------------------- destructive command check
 
 # Matches any rm flag combination that includes -r or -R
@@ -527,7 +761,11 @@ def check_pypi(name):
             dt = parse_dt(f.get("upload_time_iso_8601") or f.get("upload_time"))
             if dt and (earliest is None or dt < earliest):
                 earliest = dt
-    return {"exists": True, "age_days": age_days(earliest), "downloads": None}
+    downloads = None
+    _, dd = http_get_json("https://pypistats.org/api/packages/" + urllib.parse.quote(name.lower()) + "/recent")
+    if dd and isinstance((dd.get("data") or {}).get("last_month"), (int, float)):
+        downloads = int(dd["data"]["last_month"])
+    return {"exists": True, "age_days": age_days(earliest), "downloads": downloads}
 
 
 # --------------------------------------------------- look-alike check
@@ -613,8 +851,10 @@ def main():
             decision, reason = rm_result
             emit(decision, reason)
 
-        # Rules 1 + 3: slopsquatting / one-off runners (registry lookups)
+        # Rules 1 + 3 + 4: slopsquatting / one-off runners / manifest installs
+        cwd = data.get("cwd") or os.getcwd()
         targets = parse_install_targets(command)
+        targets += parse_manifest_targets(command, cwd)
         seen, uniq = set(), []
         for t in targets:
             if t not in seen:
