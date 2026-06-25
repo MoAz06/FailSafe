@@ -32,9 +32,9 @@ AI assistants hallucinate package names. Attackers pre-register those names with
 
 | Situation | Action |
 | :-- | :-- |
-| Package **does not exist** on npm / PyPI | Deny |
+| Package **does not exist** on npm / PyPI / crates.io / Go proxy | Deny |
 | Exists but **one edit away** from a popular package (`expres` vs `express`) | Ask |
-| Package exists but **< 90 days old** with **< 100 downloads/month** | Ask |
+| Package exists but **< 90 days old** with **< 100 downloads/month** (npm/PyPI) or **< 500 recent downloads** (Cargo) | Ask |
 | Everything else | Allow (silent) |
 
 **Module 2 -- Destructive commands**
@@ -111,6 +111,30 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 
 Sensitive file patterns: `.env`, `.env.*`, `~/.ssh/*`, `*.pem`, `*.key`, `*.p12`, `id_rsa`, `id_ed25519`, `.netrc`, `.npmrc`, `.aws/credentials`.
 
+**Module 9 -- Cargo and Go modules**
+
+| Situation | Action |
+| :-- | :-- |
+| `cargo add` / `cargo install` -- crate not found on crates.io | Deny |
+| Crate one character away from a popular crate (`serde_jso` vs `serde_json`) | Ask |
+| Crate < 90 days old with < 500 recent downloads | Ask |
+| `go get` / `go install` -- module not found on the Go module proxy | Deny |
+| `--git` or `--path` sources | Ignored (not registry installs) |
+| Private/unknown Go module domains | Ignored (avoids false positives) |
+
+**Configuration (`failsafe.toml`)**
+
+Place a `failsafe.toml` in your project root (or `~/.config/failsafe/config.toml`) to tune behavior:
+
+```toml
+[failsafe]
+strict = false                          # true: upgrade all "ask" to "deny"
+protected_branches = ["main", "prod"]   # replaces the default protected list
+allowed_packages = ["my-internal-tool"] # always allow these names
+```
+
+All settings are optional. Zero-config remains the default.
+
 ---
 
 ## Blocked command examples
@@ -177,8 +201,8 @@ PreToolUse hook  ->  parse the Bash command
 - Score package reputation the way Socket.dev or Snyk do -- it checks existence and simple heuristics, not full supply chain analysis.
 - Catch every possible dangerous command -- it targets the patterns agents actually produce, not a complete policy engine.
 - Protect against a compromised package that already exists on the registry.
-- Inspect lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`).
-- Parse `pyproject.toml` on Python < 3.11 (no `tomllib` -- fails open).
+- Inspect `pnpm-lock.yaml` (no stdlib YAML parser).
+- Parse `pyproject.toml` or `failsafe.toml` on Python < 3.11 (no `tomllib` -- fails open).
 - Catch runner command strings that embed the package inside a shell snippet (`npm exec -c "eslint ."`).
 
 ---
@@ -191,11 +215,11 @@ PreToolUse hook  ->  parse the Bash command
 
 ## Scope: what it checks
 
-**Install commands:** `npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`, `pip install`, `pip3 install`, `python -m pip install`, `poetry add`, `uv add`, `uv pip install`
+**Install commands:** `npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`, `pip install`, `pip3 install`, `python -m pip install`, `poetry add`, `uv add`, `uv pip install`, `cargo add`, `cargo install`, `go get`, `go install`
 
 **One-off runners:** `npx`, `npm exec|x`, `pnpm dlx`, `bunx`, `bun x`, `yarn dlx`
 
-**Manifest files on bare install:** `package.json`, `requirements.txt`, `pyproject.toml`
+**Manifest/lockfiles on bare install:** `package.json`, `package-lock.json` (npm ci), `yarn.lock`, `requirements.txt`, `pyproject.toml`, `poetry.lock`
 
 Handles: quoted names, `;` and `&&` operators, `env FOO=bar` prefixes, wrapper flags (`sudo -n`, `env -i`, `time -p`), `bash -c "..."` inner commands.
 
@@ -205,10 +229,11 @@ Ignores: local paths, git URLs, `.tgz`/`.whl` files.
 
 ## Limitations
 
-- npm and PyPI only. Cargo, Go modules, RubyGems, Maven are next.
+- npm, PyPI, crates.io, and Go proxy. RubyGems, Maven are next.
 - Look-alike detection uses a curated list of popular packages, not a full corpus.
-- Lockfiles and deeply embedded runner command strings are not inspected.
-- `pyproject.toml` requires Python 3.11+ (`tomllib`); fails open on older Python.
+- `pnpm-lock.yaml` not inspected (no stdlib YAML parser).
+- Deeply embedded runner command strings are not inspected (`npm exec -c "eslint ."`).
+- `pyproject.toml`, `poetry.lock`, and `failsafe.toml` require Python 3.11+ (`tomllib`); fails open on older Python.
 
 ---
 
@@ -220,7 +245,7 @@ To add a new rule:
 2. Wire it into `main()` before the registry lookups (if it needs no network) or after (if it does).
 3. Add a `hooks/test_<name>.py` with PASS/FAIL cases following the existing pattern.
 4. Add an e2e case to `hooks/test_e2e.py`.
-5. Run all tests: all existing 223+ cases must still pass.
+5. Run all tests: all existing 244+ cases must still pass.
 
 To add a new package ecosystem:
 
