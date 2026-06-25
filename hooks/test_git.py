@@ -35,6 +35,13 @@ git_cases = [
     # --- bash nested ---
     ("bash nested force push",      'bash -c "git push origin main --force"',    DENY),
     ("bash nested reset",           'bash -c "git reset --hard"',                ASK),
+    # --- +refspec force push to protected -> DENY ---
+    ("+refspec main",               "git push origin +main",                     DENY),
+    ("+refspec HEAD:main",          "git push origin +HEAD:main",                DENY),
+    ("+HEAD:refs/heads/main",       "git push origin +HEAD:refs/heads/main",     DENY),
+    ("+refspec master",             "git push origin +master",                   DENY),
+    # --- +refspec non-protected -> ASK ---
+    ("+refspec feature",            "git push origin +feature",                  ASK),
     # --- ALLOW ---
     ("normal push",                 "git push origin main",                      ALLOW),
     ("push to feature",             "git push origin feature",                   ALLOW),
