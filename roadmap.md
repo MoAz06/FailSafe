@@ -217,7 +217,7 @@ or `~/.codex/config.toml`.
 - Update README install instructions for both agents.
 
 Known limitation: Codex's own docs say PreToolUse "doesn't intercept all shell
-calls yet, only the simple ones" — coverage will be lower than Claude Code until
+calls yet, only the simple ones" -- coverage will be lower than Claude Code until
 Codex matures.
 
 Success looks like:
