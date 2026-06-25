@@ -26,6 +26,14 @@ FailSafe runs as a `PreToolUse` hook. A hook deny still fires in bypass mode. Th
 | `rm -rf` on `/`, `~`, `$HOME`, `/etc`, `/usr`, `/home/<user>`, or any top-level system directory | Deny |
 | `rm -rf` on relative paths, `/tmp/...`, or deep subdirectories | Allow |
 
+**One-off runners (module 3)**
+
+| Situation | Action |
+| :-- | :-- |
+| `npx`, `npm exec`, `npm x`, `pnpm dlx`, `bunx`, `bun x`, or `yarn dlx` runs a package that does not exist on npm | Deny |
+| Runner target is one edit away from a popular package, or is suspiciously fresh/low-download | Ask |
+| Local paths such as `npx ./scripts/tool.js` | Allow |
+
 More rules are coming.
 
 **Design principles**
@@ -63,23 +71,24 @@ echo '{"tool_name":"Bash","tool_input":{"command":"npm install totally-not-a-rea
 
 ## Scope: what it checks
 
-FailSafe inspects packages passed as **direct arguments** to an install command:
+FailSafe inspects packages passed as **direct arguments** to install commands and one-off runners:
 
 `npm install|i|add` · `pnpm add|install|i` · `yarn add` · `bun add|install|i` ·
 `pip install` · `pip3 install` · `python -m pip install` · `poetry add` ·
-`uv add` · `uv pip install`
+`uv add` · `uv pip install` · `npx` · `npm exec|x` · `pnpm dlx` · `bunx` ·
+`bun x` · `yarn dlx`
 
 It handles quoted names, `env FOO=bar` prefixes, wrappers (`sudo`, `env`), and
 `bash -c "..."` inner commands. Local paths, git URLs, `.tgz`/`.whl`, and lockfile installs (`npm ci`) are ignored.
 
 **Not yet inspected:**
 - Manifest installs: bare `npm install`, `pip install -r`, `poetry install`, `uv sync`.
-- One-off runners: `npx`, `pnpm dlx`, `bunx`, `npm exec`.
+- Runner command strings that hide the package inside a shell snippet, such as `npm exec -c "eslint --fix ."`.
 
 ## How it works
 
 ```
-PreToolUse hook  ->  parse the Bash command for install intents
+PreToolUse hook  ->  parse the Bash command for install / runner intents
                  ->  for each package, query the registry (npmjs.org / pypi.org)
                  ->  deny if missing  /  ask if suspicious  /  allow otherwise
 ```
@@ -88,7 +97,7 @@ PreToolUse hook  ->  parse the Bash command for install intents
 
 ## Limitations
 
-- Direct arguments only. Manifest installs and one-off runners are not inspected yet.
+- Direct arguments only. Manifest installs and deeply embedded runner command strings are not inspected yet.
 - npm and PyPI only today. Cargo, Go modules, RubyGems, Maven are next.
 - The look-alike list is a small curated set of popular packages.
 - Existence check trusts the registry. It does not score package reputation the way Socket/Snyk do - it is a free, zero-config first line of defense, not a full SCA.

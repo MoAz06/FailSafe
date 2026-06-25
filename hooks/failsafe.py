@@ -10,6 +10,8 @@ Current rules:
   1. Slopsquatting defense - blocks installs of non-existent packages
      (AI hallucinated names attackers pre-register with malware).
   2. Destructive rm - blocks rm -rf on root, home, and system dirs.
+  3. One-off runner defense - checks npx/npm exec/pnpm dlx/bunx targets
+     before the agent executes registry code.
 
 Design rules:
   - FAIL OPEN. Any unexpected error -> allow. A guard that breaks your
@@ -76,6 +78,11 @@ NPM_VALUE_FLAGS = {
     "--registry", "--prefix", "-C", "--workspace", "-w", "--save-prefix",
     "--omit", "--include", "--tag", "--access", "--otp", "--loglevel", "--cache",
 }
+JS_RUNNER_PACKAGE_FLAGS = {"--package", "-p"}
+JS_RUNNER_VALUE_FLAGS = NPM_VALUE_FLAGS | {
+    "--call", "-c", "--shell", "--script-shell", "--userconfig",
+    "--node-arg", "-n",
+}
 
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 WRAPPERS = {"env", "sudo", "doas", "command", "time", "nice", "exec", "xargs"}
@@ -88,7 +95,7 @@ PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --------------------------------------------------------------- HTTP
 def http_get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.3"})
+    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.4"})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             status = getattr(r, "status", 200)
@@ -144,6 +151,18 @@ def split_segments(toks):
     return segments
 
 
+def add_js_target(arg, targets):
+    if not arg or arg.startswith("-") or arg in (".", ".."):
+        return False
+    if is_js_local_or_url(arg):
+        return False
+    name = strip_npm_version(arg)
+    if name and not name.startswith("-") and NPM_NAME_RE.match(name):
+        targets.append(("npm", name))
+        return True
+    return False
+
+
 def collect_js(args, targets, value_flags):
     skip_next = False
     for a in args:
@@ -155,11 +174,57 @@ def collect_js(args, targets, value_flags):
             continue
         if a.startswith("-") or a in (".", ".."):
             continue
-        if is_js_local_or_url(a):
+        add_js_target(a, targets)
+
+
+def _flag_value(token, flags):
+    for flag in flags:
+        prefix = flag + "="
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return None
+
+
+def collect_js_runner(args, targets):
+    """Collect packages executed by npx/npm exec/pnpm dlx/bunx style runners."""
+    skip_next = False
+    explicit_package = False
+    after_double_dash = False
+
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
             continue
-        name = strip_npm_version(a)
-        if name and not name.startswith("-") and NPM_NAME_RE.match(name):
-            targets.append(("npm", name))
+
+        if not after_double_dash:
+            if a == "--":
+                after_double_dash = True
+                continue
+
+            value = _flag_value(a, JS_RUNNER_PACKAGE_FLAGS)
+            if value is not None:
+                if add_js_target(value, targets):
+                    explicit_package = True
+                continue
+
+            if a in JS_RUNNER_PACKAGE_FLAGS:
+                if i + 1 < len(args) and add_js_target(args[i + 1], targets):
+                    explicit_package = True
+                skip_next = True
+                continue
+
+            if a in JS_RUNNER_VALUE_FLAGS:
+                skip_next = True
+                continue
+            if _flag_value(a, JS_RUNNER_VALUE_FLAGS) is not None:
+                continue
+            if a.startswith("-"):
+                continue
+
+        if explicit_package:
+            return
+        add_js_target(a, targets)
+        return
 
 
 def collect_py(args, targets, value_flags):
@@ -221,6 +286,25 @@ def parse_install_targets(command, _depth=0):
         if mgr in ("pip", "pip3"):
             if rest and rest[0] == "install":
                 collect_py(rest[1:], targets, PIP_VALUE_FLAGS)
+            continue
+        if mgr == "npx":
+            collect_js_runner(rest, targets)
+            continue
+        if mgr == "npm":
+            if rest and rest[0] in ("exec", "x"):
+                collect_js_runner(rest[1:], targets)
+                continue
+        if mgr == "pnpm" and rest and rest[0] == "dlx":
+            collect_js_runner(rest[1:], targets)
+            continue
+        if mgr == "bunx":
+            collect_js_runner(rest, targets)
+            continue
+        if mgr == "bun" and rest and rest[0] == "x":
+            collect_js_runner(rest[1:], targets)
+            continue
+        if mgr == "yarn" and rest and rest[0] == "dlx":
+            collect_js_runner(rest[1:], targets)
             continue
         if mgr in JS_MANAGERS:
             if rest and rest[0] in JS_MANAGERS[mgr]:
@@ -470,7 +554,7 @@ def main():
             decision, reason = rm_result
             emit(decision, reason)
 
-        # Rule 1: slopsquatting (registry lookups)
+        # Rules 1 + 3: slopsquatting / one-off runners (registry lookups)
         targets = parse_install_targets(command)
         seen, uniq = set(), []
         for t in targets:
