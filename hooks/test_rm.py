@@ -38,6 +38,23 @@ cases = [
     ("rm -rf /var/*",        "rm -rf /var/*",              DENY),
     ("rm home brace glob",   "rm -rf ~/{*,.*}",            DENY),
     ("rm user brace glob",   "rm -rf /home/mo24a/{*,.*}",  DENY),
+    # --- Windows paths (Git Bash drive mounts) ---
+    ("win drive root /c",    "rm -rf /c",                  DENY),
+    ("win drive root /c/",   "rm -rf /c/",                 DENY),
+    ("win drive root /d",    "rm -rf /d",                  DENY),
+    ("win C:\\Users",        "rm -rf /c/Users",            DENY),
+    ("win C:\\Users\\user",  "rm -rf /c/Users/mo24a",      DENY),
+    ("win C:\\Users glob",   "rm -rf /c/Users/*",          DENY),
+    ("win C:\\Windows",      "rm -rf /c/Windows",          DENY),
+    ("win Program Files",    'rm -rf "/c/Program Files"',  DENY),
+    ("win $USERPROFILE",     "rm -rf $USERPROFILE",        DENY),
+    ("win $WINDIR",          "rm -rf $WINDIR",             DENY),
+    ("win $SYSTEMROOT",      "rm -rf $SYSTEMROOT",         DENY),
+    ("win $PROGRAMFILES",    "rm -rf $PROGRAMFILES",       DENY),
+    # --- Windows paths that should ALLOW ---
+    ("win project dir",      "rm -rf /c/projects/myapp",   ALLOW),
+    ("win tmp dir",          "rm -rf /c/tmp/stuff",        ALLOW),
+    ("win deep user path",   "rm -rf /c/Users/mo24a/proj", ALLOW),
     # --- should ALLOW ---
     ("rm -rf ./node_modules","rm -rf ./node_modules",      ALLOW),
     ("rm -rf dist",          "rm -rf dist",                ALLOW),
