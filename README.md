@@ -2,7 +2,7 @@
 
 **The zero-config agent seatbelt for Claude Code.**
 
-When you run an AI agent in autonomous mode, one bad command can delete your home directory, drop a production database, or install malware from a hallucinated package name. Claude Code has a permissions system for this — but `--dangerously-skip-permissions` turns it all off.
+When you run an AI agent in autonomous mode, one bad command can delete your home directory, drop a production database, or install malware from a hallucinated package name. Claude Code has a permissions system for this -- but `--dangerously-skip-permissions` turns it all off.
 
 FailSafe runs as a `PreToolUse` hook. **A hook deny still fires in bypass mode.** That is the whole point.
 
@@ -26,7 +26,7 @@ No configuration needed. No dependencies. Requires Python 3.8+ on your PATH.
 
 ## What it blocks
 
-**Module 1 — Slopsquatting**
+**Module 1 -- Slopsquatting**
 
 AI assistants hallucinate package names. Attackers pre-register those names with malware and wait. This is called slopsquatting. In 2025, an estimated 28% of malicious packages were LLM-hallucinated versions of real ones, and 43% of hallucinated names recur on every run of the same prompt.
 
@@ -37,7 +37,7 @@ AI assistants hallucinate package names. Attackers pre-register those names with
 | Package exists but **< 90 days old** with **< 100 downloads/month** | Ask |
 | Everything else | Allow (silent) |
 
-**Module 2 — Destructive commands**
+**Module 2 -- Destructive commands**
 
 | Situation | Action |
 | :-- | :-- |
@@ -46,7 +46,7 @@ AI assistants hallucinate package names. Attackers pre-register those names with
 | Windows paths: `/c/`, `/c/Users`, `$USERPROFILE`, `$WINDIR`, `$SYSTEMROOT` | Deny |
 | `rm -rf` on relative paths, `/tmp/...`, or deep subdirectories | Allow |
 
-**Module 3 — One-off runners**
+**Module 3 -- One-off runners**
 
 | Situation | Action |
 | :-- | :-- |
@@ -54,27 +54,27 @@ AI assistants hallucinate package names. Attackers pre-register those names with
 | Runner target is a look-alike or suspiciously fresh | Ask |
 | Local paths such as `npx ./scripts/tool.js` | Allow |
 
-**Module 4 — Manifest installs**
+**Module 4 -- Manifest installs**
 
 A bare install pulls every dependency from a manifest file. An agent can inject a hallucinated package into `package.json` or `requirements.txt` and then run a bare install. FailSafe reads the manifest first.
 
 | Situation | Action |
 | :-- | :-- |
-| `npm/pnpm/yarn/bun install` reads `package.json` — a dep does not exist | Deny |
-| `pip install -r <file>` / `uv pip install -r <file>` — a dep does not exist | Deny |
-| `poetry install` / `uv sync` reads `pyproject.toml` — a dep does not exist | Deny |
+| `npm/pnpm/yarn/bun install` reads `package.json` -- a dep does not exist | Deny |
+| `pip install -r <file>` / `uv pip install -r <file>` -- a dep does not exist | Deny |
+| `poetry install` / `uv sync` reads `pyproject.toml` -- a dep does not exist | Deny |
 | Local/git/url/workspace specs | Ignored |
 
-**Module 5 — Curl-pipe-shell**
+**Module 5 -- Curl-pipe-shell**
 
 | Situation | Action |
 | :-- | :-- |
-| `curl http://... \| bash` — plain HTTP remote script | Deny |
+| `curl http://... \| bash` -- plain HTTP remote script | Deny |
 | `curl https://... \| bash/sh/python/node/ruby` | Ask |
 | `wget ... \| sh` | Ask |
 | `curl ... \| grep` or piped to non-shell | Allow |
 
-**Module 6 — Git disaster**
+**Module 6 -- Git disaster**
 
 | Situation | Action |
 | :-- | :-- |
@@ -85,7 +85,7 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 | `git branch -D <branch>` | Ask |
 | Normal git operations | Allow |
 
-**Module 7 — Cloud / infra blast radius**
+**Module 7 -- Cloud / infra blast radius**
 
 | Situation | Action |
 | :-- | :-- |
@@ -98,7 +98,7 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 | `az group delete` | Ask |
 | Normal read/plan operations | Allow |
 
-**Module 8 — Secrets exfiltration**
+**Module 8 -- Secrets exfiltration**
 
 | Situation | Action |
 | :-- | :-- |
@@ -150,10 +150,10 @@ Force pushing to 'main' permanently overwrites remote history.
 
 ## Design principles
 
-- **Fails open** — any network error or unexpected failure allows the action. A guard that breaks your workflow gets uninstalled.
-- **Fast path** — non-network rules (rm, git, cloud, secrets) return instantly with zero I/O.
-- **Conservative** — only near-certain danger hard-blocks. Fuzzy signals escalate to a prompt.
-- **Zero dependencies** — pure Python 3 standard library.
+- **Fails open** -- any network error or unexpected failure allows the action. A guard that breaks your workflow gets uninstalled.
+- **Fast path** -- non-network rules (rm, git, cloud, secrets) return instantly with zero I/O.
+- **Conservative** -- only near-certain danger hard-blocks. Fuzzy signals escalate to a prompt.
+- **Zero dependencies** -- pure Python 3 standard library.
 
 ---
 
@@ -172,11 +172,11 @@ PreToolUse hook  ->  parse the Bash command
 
 ## What FailSafe will not do
 
-- Score package reputation the way Socket.dev or Snyk do — it checks existence and simple heuristics, not full supply chain analysis.
-- Catch every possible dangerous command — it targets the patterns agents actually produce, not a complete policy engine.
+- Score package reputation the way Socket.dev or Snyk do -- it checks existence and simple heuristics, not full supply chain analysis.
+- Catch every possible dangerous command -- it targets the patterns agents actually produce, not a complete policy engine.
 - Protect against a compromised package that already exists on the registry.
 - Inspect lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`).
-- Parse `pyproject.toml` on Python < 3.11 (no `tomllib` — fails open).
+- Parse `pyproject.toml` on Python < 3.11 (no `tomllib` -- fails open).
 - Catch runner command strings that embed the package inside a shell snippet (`npm exec -c "eslint ."`).
 
 ---
