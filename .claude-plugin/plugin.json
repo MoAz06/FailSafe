@@ -1,7 +1,7 @@
 {
   "name": "failsafe",
   "description": "The zero-config agent seatbelt for Claude Code. Blocks dangerous agent actions - hallucinated package installs, destructive commands, and more - even in --dangerously-skip-permissions mode.",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "author": {
     "name": "Mohamed Azahrioui"
   },
