@@ -131,6 +131,23 @@ check("wget https | sh -> ask",         d, r, "ask",   "remote script")
 d, r = run_hook("curl https://example.com/data.json | jq .")
 check("curl | jq -> allow",             d, r, None)
 
+# ── Module 9: Cargo / Go ──────────────────────────────────────────────────
+print("\n=== Module 9: Cargo / Go ===")
+d, r = run_hook("cargo add totally-fake-failsafe-crate-xyz987")
+check("cargo fake crate -> deny",           d, r, "deny",  "not found")
+
+d, r = run_hook("cargo add serde")
+check("cargo real crate -> allow",          d, r, None)
+
+d, r = run_hook("cargo add --git https://github.com/x/y serde")
+check("cargo --git -> allow (non-registry)",d, r, None)
+
+d, r = run_hook("go get github.com/totally-fake-failsafe-go-xyz987/pkg@latest")
+check("go get fake module -> deny",         d, r, "deny",  "not found")
+
+d, r = run_hook("go get github.com/gin-gonic/gin@latest")
+check("go get real module -> allow",        d, r, None)
+
 # ── Module 6: Git disaster ─────────────────────────────────────────────────
 print("\n=== Module 6: Git disaster ===")
 d, r = run_hook("git push origin main --force")
