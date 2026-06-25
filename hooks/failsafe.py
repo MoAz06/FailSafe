@@ -51,10 +51,11 @@ LOW_DOWNLOADS = 100
 MAX_PACKAGES = 25  # beyond this, fail open rather than stall the agent
 
 
-def _load_config():
+def _load_config(cwd=None):
     """Load failsafe.toml (project-level first, then ~/.config/failsafe/). Returns {}."""
+    search_cwd = cwd or os.getcwd()
     paths = [
-        os.path.join(os.getcwd(), "failsafe.toml"),
+        os.path.join(search_cwd, "failsafe.toml"),
         os.path.expanduser(os.path.join("~", ".config", "failsafe", "config.toml")),
     ]
     for p in paths:
@@ -524,7 +525,7 @@ def _parse_package_json(text):
                 sl = spec.lower()
                 if sl.startswith(_JS_SKIP_SPEC_PREFIXES):
                     continue  # local path, git, url, or workspace alias
-                # npm alias: "alias": "npm:real-pkg@version" — check real pkg
+                # npm alias: "alias": "npm:real-pkg@version" -- check real pkg
                 if sl.startswith("npm:"):
                     real = strip_npm_version(spec[4:])
                     if real and NPM_NAME_RE.match(real):
@@ -1566,6 +1567,13 @@ def main():
         if not command or not isinstance(command, str):
             return
 
+        # Reload config using the project cwd from the payload.
+        # The module-level _CONFIG was loaded at import using the hook's own
+        # working directory, which may differ from the project being worked on.
+        global _CONFIG
+        cwd = data.get("cwd") or os.getcwd()
+        _CONFIG = _load_config(cwd)
+
         # Rule 2: destructive rm (instant, no network)
         rm_result = check_destructive_rm(command)
         if rm_result:
@@ -1597,7 +1605,6 @@ def main():
             emit(decision, reason)
 
         # Rules 1 + 3 + 4: slopsquatting / one-off runners / manifest installs
-        cwd = data.get("cwd") or os.getcwd()
         targets = parse_install_targets(command)
         targets += parse_manifest_targets(command, cwd)
         seen, uniq = set(), []
@@ -1624,9 +1631,10 @@ def main():
                  "legitimate, install it yourself outside the agent." % listing)
         if asks:
             listing = "\n".join("  - %s: %s" % (n, r) for n, r in asks)
-            emit("ask",
+            pkg_ask = _strict(("ask",
                  "FailSafe flagged a possibly suspicious package:\n%s\n\n"
-                 "Review before installing." % listing)
+                 "Review before installing." % listing))
+            emit(*pkg_ask)
     except Exception:
         pass  # fail open
     sys.exit(0)
