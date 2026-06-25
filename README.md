@@ -2,127 +2,232 @@
 
 **The zero-config agent seatbelt for Claude Code.**
 
-When you run an AI agent in autonomous mode, one bad command can delete your home directory, drop a production database, or install malware from a hallucinated package name. Claude Code has a permissions system for this - but `--dangerously-skip-permissions` turns it all off.
+When you run an AI agent in autonomous mode, one bad command can delete your home directory, drop a production database, or install malware from a hallucinated package name. Claude Code has a permissions system for this — but `--dangerously-skip-permissions` turns it all off.
 
-FailSafe runs as a `PreToolUse` hook. A hook deny still fires in bypass mode. That is the whole point.
+FailSafe runs as a `PreToolUse` hook. **A hook deny still fires in bypass mode.** That is the whole point.
 
 ---
 
-## What it blocks
-
-**Slopsquatting (module 1)**
-
-| Situation | Action |
-| :-- | :-- |
-| Package **does not exist** on npm / PyPI | Deny - almost always a hallucination |
-| Exists, but **one edit away** from a popular package (e.g. `expres` vs `express`, `loadsh` vs `lodash`) | Ask - possible typosquat or look-alike |
-| Package exists, but was **published < 90 days ago** with **< 100 downloads/month** | Ask - suspiciously fresh |
-| Everything else | Allow (silent, no slowdown) |
-
-**Destructive commands (module 2)**
-
-| Situation | Action |
-| :-- | :-- |
-| `rm -rf` on `/`, `~`, `$HOME`, `/etc`, `/usr`, `/home/<user>`, root-level system directories, or their root globs | Deny |
-| `rm -rf` on relative paths, `/tmp/...`, or deep subdirectories | Allow |
-
-**One-off runners (module 3)**
-
-| Situation | Action |
-| :-- | :-- |
-| `npx`, `npm exec`, `npm x`, `pnpm dlx`, `bunx`, `bun x`, or `yarn dlx` runs a package that does not exist on npm | Deny |
-| Runner target is one edit away from a popular package, or is suspiciously fresh/low-download | Ask |
-| Local paths such as `npx ./scripts/tool.js` | Allow |
-
-**Manifest installs (module 4)**
-
-A bare install pulls every dependency declared in a manifest file. FailSafe reads the manifest and runs the same registry checks on each declared package, so a hallucinated dep hidden in a file is caught just like a direct argument.
-
-| Situation | Action |
-| :-- | :-- |
-| `npm/pnpm/yarn/bun install` (no package arg) reads `package.json` and a dep does not exist | Deny |
-| `pip install -r <file>`, `uv pip install -r <file>` reads the requirements file and a dep does not exist | Deny |
-| `poetry install` / `uv sync` reads `pyproject.toml` and a dep does not exist | Deny |
-| A declared dep is a look-alike or suspiciously fresh | Ask |
-| Local/git/url/workspace specs in the manifest | Ignored |
-
-Only source manifests are parsed (`package.json`, `requirements.txt`, `pyproject.toml`). Generated lockfiles and YAML lockfiles are not. `pyproject.toml` parsing requires Python 3.11+ (`tomllib`); on older Python it fails open.
-
-More rules are coming.
-
-**Design principles**
-- Fails open - any network error or unexpected failure allows the action. A guard that breaks your workflow gets uninstalled.
-- Fast path - non-install commands return instantly with zero network calls.
-- Conservative - only "does not exist" hard-blocks. Fuzzy signals only escalate to a prompt.
-- Zero dependencies - pure Python 3 standard library.
-
-## Why this matters
-
-Research shows **43% of hallucinated package names recur on every run of the same prompt**. Attackers watch for these names, pre-register them on npm/PyPI with malware, and wait. In 2025 an estimated **28% of malicious packages were LLM-hallucinated versions** of real ones. This attack is called slopsquatting.
-
-And that is just packages. Agents running in bypass mode have deleted production databases and wiped developer machines. FailSafe is the last layer that cannot be skipped.
-
-## Requirements
-
-- **Python 3.8+** on your PATH (`python3` or `python`).
-
-## Try it
+## Install
 
 ```bash
 claude --plugin-dir /path/to/failsafe
 ```
 
-Then ask Claude to install a made-up package:
-
-> "install the npm package `totally-not-a-real-pkg-xyz123`"
-
-You can also run the hook directly to see the decision:
+Or for bypass mode (where FailSafe matters most):
 
 ```bash
-echo '{"tool_name":"Bash","tool_input":{"command":"npm install totally-not-a-real-pkg-xyz123"}}' \
-  | python hooks/failsafe.py
+claude --dangerously-skip-permissions --plugin-dir /path/to/failsafe
 ```
 
-## Scope: what it checks
+No configuration needed. No dependencies. Requires Python 3.8+ on your PATH.
 
-FailSafe inspects packages passed as **direct arguments** to install commands and one-off runners:
+---
 
-`npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`,
-`pip install`, `pip3 install`, `python -m pip install`, `poetry add`,
-`uv add`, `uv pip install`, `npx`, `npm exec|x`, `pnpm dlx`, `bunx`,
-`bun x`, `yarn dlx`
+## What it blocks
 
-It handles quoted names, shell operators such as `;` and `&&`, `env FOO=bar`
-prefixes, common wrapper flags (`sudo -n`, `env -i`, `time -p`), and `bash -c "..."`
-inner commands. Local paths, git URLs, and `.tgz`/`.whl` are ignored.
+**Module 1 — Slopsquatting**
 
-It also reads source manifests on bare installs (see module 4): `package.json`
-for `npm/pnpm/yarn/bun install` and `npm ci`, the requirements file for
-`pip install -r` / `uv pip install -r`, and `pyproject.toml` for `poetry install`
-/ `uv sync`.
+AI assistants hallucinate package names. Attackers pre-register those names with malware and wait. This is called slopsquatting. In 2025, an estimated 28% of malicious packages were LLM-hallucinated versions of real ones, and 43% of hallucinated names recur on every run of the same prompt.
 
-**Not yet inspected:**
-- Lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `poetry.lock`, `uv.lock`).
-- `pyproject.toml` on Python < 3.11 (no `tomllib`).
-- Runner command strings that hide the package inside a shell snippet, such as `npm exec -c "eslint --fix ."`.
+| Situation | Action |
+| :-- | :-- |
+| Package **does not exist** on npm / PyPI | Deny |
+| Exists but **one edit away** from a popular package (`expres` vs `express`) | Ask |
+| Package exists but **< 90 days old** with **< 100 downloads/month** | Ask |
+| Everything else | Allow (silent) |
+
+**Module 2 — Destructive commands**
+
+| Situation | Action |
+| :-- | :-- |
+| `rm -rf` on `/`, `~`, `$HOME`, `/etc`, `/usr`, `/home/<user>`, system dirs, or root globs | Deny |
+| `rm -rf .git` (destroys repo history) | Deny |
+| Windows paths: `/c/`, `/c/Users`, `$USERPROFILE`, `$WINDIR`, `$SYSTEMROOT` | Deny |
+| `rm -rf` on relative paths, `/tmp/...`, or deep subdirectories | Allow |
+
+**Module 3 — One-off runners**
+
+| Situation | Action |
+| :-- | :-- |
+| `npx`, `npm exec`, `pnpm dlx`, `bunx`, `bun x`, `yarn dlx` runs a non-existent package | Deny |
+| Runner target is a look-alike or suspiciously fresh | Ask |
+| Local paths such as `npx ./scripts/tool.js` | Allow |
+
+**Module 4 — Manifest installs**
+
+A bare install pulls every dependency from a manifest file. An agent can inject a hallucinated package into `package.json` or `requirements.txt` and then run a bare install. FailSafe reads the manifest first.
+
+| Situation | Action |
+| :-- | :-- |
+| `npm/pnpm/yarn/bun install` reads `package.json` — a dep does not exist | Deny |
+| `pip install -r <file>` / `uv pip install -r <file>` — a dep does not exist | Deny |
+| `poetry install` / `uv sync` reads `pyproject.toml` — a dep does not exist | Deny |
+| Local/git/url/workspace specs | Ignored |
+
+**Module 5 — Curl-pipe-shell**
+
+| Situation | Action |
+| :-- | :-- |
+| `curl http://... \| bash` — plain HTTP remote script | Deny |
+| `curl https://... \| bash/sh/python/node/ruby` | Ask |
+| `wget ... \| sh` | Ask |
+| `curl ... \| grep` or piped to non-shell | Allow |
+
+**Module 6 — Git disaster**
+
+| Situation | Action |
+| :-- | :-- |
+| `git push --force` to `main`, `master`, `production`, `release`, `prod`, `staging` | Deny |
+| `git push --force` to any other branch, or `--force-with-lease` | Ask |
+| `git reset --hard` or `--merge` | Ask |
+| `git clean -f` / `-fd` / `-fdx` (without dry-run) | Ask |
+| `git branch -D <branch>` | Ask |
+| Normal git operations | Allow |
+
+**Module 7 — Cloud / infra blast radius**
+
+| Situation | Action |
+| :-- | :-- |
+| `terraform destroy` | Ask |
+| `kubectl delete namespace` / `--all` / `-A` | Ask |
+| `docker system prune -a` | Ask |
+| `docker volume rm` | Ask |
+| `aws s3 rm --recursive` / `sync --delete` | Ask |
+| `gcloud projects delete` | Ask |
+| `az group delete` | Ask |
+| Normal read/plan operations | Allow |
+
+**Module 8 — Secrets exfiltration**
+
+| Situation | Action |
+| :-- | :-- |
+| `cat .env \| curl` / `cat ~/.ssh/id_rsa \| nc` | Ask |
+| `curl -d @.env https://...` / `curl -F file=@.env` | Ask |
+| `scp .env user@host:.` / `rsync .env user@host:` | Ask |
+| Reading `.env` locally without network | Allow |
+
+Sensitive file patterns: `.env`, `.env.*`, `~/.ssh/*`, `*.pem`, `*.key`, `*.p12`, `id_rsa`, `id_ed25519`, `.netrc`, `.npmrc`, `.aws/credentials`.
+
+---
+
+## Blocked command examples
+
+```
+$ echo '{"tool_name":"Bash","tool_input":{"command":"npm install totally-not-real-pkg-xyz123"}}' \
+    | python hooks/failsafe.py
+
+permissionDecision: deny
+reason: FailSafe blocked this install:
+  - totally-not-real-pkg-xyz123: not found on the npm registry
+
+AI assistants sometimes invent package names that don't exist; attackers
+pre-register those names with malware ("slopsquatting"). Verify the correct
+name on the official registry before installing.
+```
+
+```
+$ echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}' \
+    | python hooks/failsafe.py
+
+permissionDecision: deny
+reason: FailSafe blocked a destructive command:
+  rm -rf /
+This would permanently delete the filesystem root (/).
+```
+
+```
+$ echo '{"tool_name":"Bash","tool_input":{"command":"git push origin main --force"}}' \
+    | python hooks/failsafe.py
+
+permissionDecision: deny
+reason: FailSafe blocked a force push to a protected branch:
+  git push origin main --force
+Force pushing to 'main' permanently overwrites remote history.
+```
+
+---
+
+## Design principles
+
+- **Fails open** — any network error or unexpected failure allows the action. A guard that breaks your workflow gets uninstalled.
+- **Fast path** — non-network rules (rm, git, cloud, secrets) return instantly with zero I/O.
+- **Conservative** — only near-certain danger hard-blocks. Fuzzy signals escalate to a prompt.
+- **Zero dependencies** — pure Python 3 standard library.
+
+---
 
 ## How it works
 
 ```
-PreToolUse hook  ->  parse the Bash command for install / runner intents
-                 ->  for each package, query the registry (npmjs.org / pypi.org)
-                 ->  deny if missing  /  ask if suspicious  /  allow otherwise
+PreToolUse hook  ->  parse the Bash command
+                 ->  run instant checks (rm, git, cloud, curl-pipe, secrets)
+                 ->  for install commands, query npm / PyPI registries
+                 ->  deny if dangerous  /  ask if suspicious  /  allow otherwise
 ```
 
 `hooks/hooks.json` wires the hook on the `Bash` tool. `hooks/failsafe.py` does the work.
 
+---
+
+## What FailSafe will not do
+
+- Score package reputation the way Socket.dev or Snyk do — it checks existence and simple heuristics, not full supply chain analysis.
+- Catch every possible dangerous command — it targets the patterns agents actually produce, not a complete policy engine.
+- Protect against a compromised package that already exists on the registry.
+- Inspect lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`).
+- Parse `pyproject.toml` on Python < 3.11 (no `tomllib` — fails open).
+- Catch runner command strings that embed the package inside a shell snippet (`npm exec -c "eslint ."`).
+
+---
+
+## Requirements
+
+- **Python 3.8+** on your PATH (`python3` or `python`).
+
+---
+
+## Scope: what it checks
+
+**Install commands:** `npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`, `pip install`, `pip3 install`, `python -m pip install`, `poetry add`, `uv add`, `uv pip install`
+
+**One-off runners:** `npx`, `npm exec|x`, `pnpm dlx`, `bunx`, `bun x`, `yarn dlx`
+
+**Manifest files on bare install:** `package.json`, `requirements.txt`, `pyproject.toml`
+
+Handles: quoted names, `;` and `&&` operators, `env FOO=bar` prefixes, wrapper flags (`sudo -n`, `env -i`, `time -p`), `bash -c "..."` inner commands.
+
+Ignores: local paths, git URLs, `.tgz`/`.whl` files.
+
+---
+
 ## Limitations
 
-- Direct arguments and source manifests are inspected; generated lockfiles and deeply embedded runner command strings are not.
-- npm and PyPI only today. Cargo, Go modules, RubyGems, Maven are next.
-- npm and PyPI checks cover existence, look-alikes, package age, and monthly download counts. PyPI download data comes from pypistats.org.
-- The look-alike list is a small curated set of popular packages.
-- Existence check trusts the registry. It does not score package reputation the way Socket/Snyk do - it is a free, zero-config first line of defense, not a full SCA.
+- npm and PyPI only. Cargo, Go modules, RubyGems, Maven are next.
+- Look-alike detection uses a curated list of popular packages, not a full corpus.
+- Lockfiles and deeply embedded runner command strings are not inspected.
+- `pyproject.toml` requires Python 3.11+ (`tomllib`); fails open on older Python.
+
+---
+
+## Contributing
+
+To add a new rule:
+
+1. Add the detection logic to `hooks/failsafe.py` as a new `check_*` function.
+2. Wire it into `main()` before the registry lookups (if it needs no network) or after (if it does).
+3. Add a `hooks/test_<name>.py` with PASS/FAIL cases following the existing pattern.
+4. Add an e2e case to `hooks/test_e2e.py`.
+5. Run all tests: all existing 223+ cases must still pass.
+
+To add a new package ecosystem:
+
+1. Add a `check_<ecosystem>` registry function following `check_npm` / `check_pypi`.
+2. Extend `parse_install_targets` to recognise the new package manager.
+3. Add look-alike detection if a popular-package list exists for the ecosystem.
+4. Add focused tests.
+
+---
 
 ## License
 
