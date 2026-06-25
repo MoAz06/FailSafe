@@ -50,6 +50,31 @@ NEW_PACKAGE_DAYS = 90
 LOW_DOWNLOADS = 100
 MAX_PACKAGES = 25  # beyond this, fail open rather than stall the agent
 
+
+def _load_config():
+    """Load failsafe.toml (project-level first, then ~/.config/failsafe/). Returns {}."""
+    paths = [
+        os.path.join(os.getcwd(), "failsafe.toml"),
+        os.path.expanduser(os.path.join("~", ".config", "failsafe", "config.toml")),
+    ]
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception:
+            continue
+        try:
+            import tomllib
+            return tomllib.loads(text).get("failsafe") or {}
+        except Exception:
+            return {}
+    return {}
+
+
+_CONFIG = _load_config()
+
 POPULAR_NPM = {
     "react", "react-dom", "react-router-dom", "lodash", "express", "axios",
     "chalk", "commander", "next", "vue", "typescript", "webpack", "eslint",
@@ -67,6 +92,19 @@ POPULAR_PYPI = {
     "psycopg2", "pymongo", "python-dotenv", "setuptools", "wheel", "black",
     "flake8", "mypy", "isort",
 }
+POPULAR_CARGO = {
+    "serde", "serde_json", "tokio", "async-std", "reqwest", "hyper",
+    "clap", "log", "env_logger", "anyhow", "thiserror", "rand",
+    "chrono", "uuid", "regex", "lazy_static", "once_cell", "rayon",
+    "itertools", "futures", "async-trait", "tracing", "axum",
+    "actix-web", "diesel", "sqlx", "rusqlite", "redis", "bytes",
+    "tower", "syn", "quote", "proc-macro2", "nom", "bindgen",
+    "wasm-bindgen", "pyo3", "crossbeam", "dashmap", "parking_lot",
+}
+PUBLIC_GO_DOMAINS = frozenset({
+    "github.com", "gitlab.com", "bitbucket.org",
+    "golang.org", "google.golang.org", "k8s.io", "sigs.k8s.io", "gopkg.in",
+})
 
 JS_MANAGERS = {
     "npm": {"install", "i", "add"},
@@ -74,6 +112,13 @@ JS_MANAGERS = {
     "yarn": {"add"},
     "bun": {"add", "install", "i"},
 }
+CARGO_VALUE_FLAGS = frozenset({
+    "--manifest-path", "--target", "--target-dir", "--features", "-F",
+    "--branch", "--tag", "--rev", "--git", "--path", "--registry",
+    "--vers", "--version", "--bin", "--example", "--root",
+})
+_CARGO_NON_REGISTRY = frozenset({"--git", "--path"})
+CARGO_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 
 # Options whose NEXT token is a value, not a package (prevents false positives
 # like `pip install --platform win_amd64 requests` denying "win_amd64").
@@ -304,6 +349,38 @@ def collect_py(args, targets, value_flags):
             targets.append(("pypi", name))
 
 
+def collect_cargo(args, targets):
+    for a in args:
+        if any(a == f or a.startswith(f + "=") for f in _CARGO_NON_REGISTRY):
+            return  # --git or --path: not a registry install
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in CARGO_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if any(a.startswith(f + "=") for f in CARGO_VALUE_FLAGS):
+            continue
+        if a.startswith("-"):
+            continue
+        name = a.split("@")[0]
+        if name and CARGO_NAME_RE.match(name):
+            targets.append(("cargo", name))
+
+
+def collect_go(args, targets):
+    for a in args:
+        if a.startswith("-"):
+            continue
+        mod = a.split("@")[0]
+        parts = mod.split("/")
+        if not parts or parts[0].lower() not in PUBLIC_GO_DOMAINS:
+            continue  # private/unknown domain -> skip (avoid false positives)
+        targets.append(("go", mod))
+
+
 def tokenize(command):
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars="|&;")
@@ -365,6 +442,16 @@ def parse_install_targets(command, _depth=0):
         if mgr == "yarn" and rest and rest[0] == "dlx":
             collect_js_runner(rest[1:], targets)
             continue
+        if mgr == "cargo":
+            if rest and rest[0] in ("add", "install"):
+                collect_cargo(rest[1:], targets)
+            continue
+
+        if mgr == "go":
+            if rest and rest[0] in ("get", "install"):
+                collect_go(rest[1:], targets)
+            continue
+
         if mgr in JS_MANAGERS:
             if rest and rest[0] in JS_MANAGERS[mgr]:
                 collect_js(rest[1:], targets, NPM_VALUE_FLAGS)
@@ -523,6 +610,76 @@ def _parse_pyproject(text):
     return targets
 
 
+def _parse_package_lock(text):
+    """Parse npm package-lock.json v2/v3 -> list of (npm, name) targets."""
+    targets = []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return targets
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        return targets
+    for key in packages:
+        if not key.startswith("node_modules/"):
+            continue
+        inner = key[len("node_modules/"):]
+        if "/node_modules/" in inner:
+            continue  # nested dep
+        if inner.startswith("@"):
+            if inner.count("/") != 1:
+                continue  # not @scope/name
+        elif "/" in inner:
+            continue  # nested path
+        if NPM_NAME_RE.match(inner):
+            targets.append(("npm", inner))
+    return targets
+
+
+def _parse_yarn_lock(text):
+    """Parse yarn.lock v1 -> list of (npm, name) targets."""
+    targets, seen = [], set()
+    for line in text.splitlines():
+        if line.startswith(" ") or line.startswith("\t") or not line.strip():
+            continue
+        if line.startswith("#"):
+            continue
+        # Entry header: 'express@^4.0.0:' or '"@scope/pkg@^1.0.0, @scope/pkg@^2.0.0":'
+        line = line.rstrip(":").strip().strip('"')
+        for entry in line.split(", "):
+            entry = entry.strip().strip('"')
+            if not entry or "@" not in entry:
+                continue
+            if entry.startswith("@"):
+                at = entry.find("@", 1)
+                name = entry[:at] if at > 0 else entry
+            else:
+                name = entry.split("@")[0]
+            name = name.strip()
+            if name and name not in seen and NPM_NAME_RE.match(name):
+                seen.add(name)
+                targets.append(("npm", name))
+    return targets
+
+
+def _parse_poetry_lock(text):
+    """Parse poetry.lock (TOML) -> list of (pypi, name) targets."""
+    targets = []
+    try:
+        import tomllib
+    except ImportError:
+        return targets
+    try:
+        data = tomllib.loads(text)
+    except Exception:
+        return targets
+    for pkg in data.get("package") or []:
+        name = pkg.get("name")
+        if name and PY_NAME_RE.match(name):
+            targets.append(("pypi", name))
+    return targets
+
+
 def _npm_prefix_dir(args, cwd):
     """Honor --prefix DIR / -C DIR so we read the right package.json."""
     for i, a in enumerate(args):
@@ -577,6 +734,12 @@ def parse_manifest_targets(command, cwd, _depth=0):
         if mgr in ("python", "python3") and len(rest) >= 2 and rest[0] == "-m" and rest[1] == "pip":
             mgr, rest = "pip", rest[2:]
 
+        # npm ci reads package-lock.json, not package.json
+        if mgr == "npm" and rest and rest[0] == "ci":
+            pkg_dir = _npm_prefix_dir(rest[1:], cwd)
+            out += _manifest_file(os.path.join(pkg_dir, "package-lock.json"), _parse_package_lock)
+            continue
+
         # JS bare install -> read package.json (only when no direct package arg)
         if mgr in JS_MANAGERS:
             is_install = (not rest and mgr == "yarn") or (rest and rest[0] in JS_INSTALL_VERBS[mgr])
@@ -586,6 +749,8 @@ def parse_manifest_targets(command, cwd, _depth=0):
                 if not direct:  # direct args are handled by parse_install_targets
                     pkg_dir = _npm_prefix_dir(rest[1:] if rest else [], cwd)
                     out += _manifest_file(os.path.join(pkg_dir, "package.json"), _parse_package_json)
+                    if mgr == "yarn":
+                        out += _manifest_file(os.path.join(pkg_dir, "yarn.lock"), _parse_yarn_lock)
             continue
 
         if mgr in ("pip", "pip3") and rest and rest[0] == "install":
@@ -602,7 +767,8 @@ def parse_manifest_targets(command, cwd, _depth=0):
             continue
 
         if mgr == "poetry" and rest and rest[0] == "install":
-            out += _manifest_file(os.path.join(cwd, "pyproject.toml"), _parse_pyproject)
+            lock = _manifest_file(os.path.join(cwd, "poetry.lock"), _parse_poetry_lock)
+            out += lock if lock else _manifest_file(os.path.join(cwd, "pyproject.toml"), _parse_pyproject)
             continue
 
     return out
@@ -938,8 +1104,14 @@ def check_git_disaster(command, _depth=0):
             plus_refspecs = [a for a in subargs
                              if not a.startswith("-") and a.startswith("+")]
             if force_flags or plus_refspecs:
+                cfg_branches = _CONFIG.get("protected_branches")
+                protected = (
+                    frozenset(b.lower() for b in cfg_branches if isinstance(b, str))
+                    if isinstance(cfg_branches, list)
+                    else _GIT_PROTECTED_BRANCHES
+                )
                 branch = _git_push_branch(subargs)
-                if branch and branch.lower() in _GIT_PROTECTED_BRANCHES:
+                if branch and branch.lower() in protected:
                     return ("deny",
                         "FailSafe blocked a force push to a protected branch:\n\n"
                         "  git push %s\n\n"
@@ -1259,6 +1431,43 @@ def check_pypi(name):
     return {"exists": True, "age_days": age_days(earliest), "downloads": downloads}
 
 
+LOW_CARGO_DOWNLOADS = 500  # recent_downloads threshold (90-day window from crates.io)
+
+
+def check_cargo(name):
+    req = urllib.request.Request(
+        "https://crates.io/api/v1/crates/" + urllib.parse.quote(name, safe=""),
+        headers={"User-Agent": "failsafe/0.5 (github.com/MoAz06/FailSafe)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+            if getattr(r, "status", 200) != 200:
+                return {"exists": None}
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return {"exists": False} if e.code == 404 else {"exists": None}
+    except Exception:
+        return {"exists": None}
+    krate = data.get("crate") or {}
+    created = parse_dt(krate.get("created_at"))
+    downloads = krate.get("recent_downloads") or krate.get("downloads")
+    return {"exists": True, "age_days": age_days(created), "downloads": downloads}
+
+
+def check_go(module):
+    # Go proxy encoding: uppercase letter X -> !x
+    encoded = re.sub(r"[A-Z]", lambda m: "!" + m.group().lower(), module)
+    url = "https://proxy.golang.org/" + encoded + "/@v/list"
+    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.5"})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+            return {"exists": getattr(r, "status", 200) == 200}
+    except urllib.error.HTTPError as e:
+        return {"exists": False} if e.code in (404, 410, 451) else {"exists": None}
+    except Exception:
+        return {"exists": None}
+
+
 # --------------------------------------------------- look-alike check
 def damerau_levenshtein(a, b):
     """Optimal string alignment: counts an adjacent transposition as 1."""
@@ -1291,8 +1500,21 @@ def nearest_popular(name, popular):
 # ------------------------------------------------------------- evaluate
 def evaluate(target):
     ecosystem, name = target
-    info = check_npm(name) if ecosystem == "npm" else check_pypi(name)
-    registry = "the npm registry" if ecosystem == "npm" else "PyPI"
+
+    allowed = _CONFIG.get("allowed_packages")
+    if isinstance(allowed, list) and name.lower() in {a.lower() for a in allowed if isinstance(a, str)}:
+        return ("allow", name, "")
+
+    if ecosystem == "npm":
+        info, registry, popular = check_npm(name), "the npm registry", POPULAR_NPM
+    elif ecosystem == "pypi":
+        info, registry, popular = check_pypi(name), "PyPI", POPULAR_PYPI
+    elif ecosystem == "cargo":
+        info, registry, popular = check_cargo(name), "crates.io", POPULAR_CARGO
+    elif ecosystem == "go":
+        info, registry, popular = check_go(name), "the Go module proxy", set()
+    else:
+        return ("allow", name, "")
 
     if info["exists"] is False:
         return ("deny", name, "not found on " + registry)
@@ -1300,17 +1522,25 @@ def evaluate(target):
         return ("allow", name, "")
 
     reasons = []
-    popular = POPULAR_NPM if ecosystem == "npm" else POPULAR_PYPI
-    look = nearest_popular(name.lower(), popular)
-    if look:
-        reasons.append('one character away from the popular package "%s" (possible look-alike)' % look)
+    if popular:
+        look = nearest_popular(name.lower(), popular)
+        if look:
+            reasons.append('one character away from the popular package "%s" (possible look-alike)' % look)
+    dl_threshold = LOW_CARGO_DOWNLOADS if ecosystem == "cargo" else LOW_DOWNLOADS
     if (info.get("age_days") is not None and info["age_days"] < NEW_PACKAGE_DAYS
-            and info.get("downloads") is not None and info["downloads"] < LOW_DOWNLOADS):
-        reasons.append("first published %d days ago with only ~%d downloads/month"
+            and info.get("downloads") is not None and info["downloads"] < dl_threshold):
+        reasons.append("first published %d days ago with only ~%d downloads"
                        % (round(info["age_days"]), info["downloads"]))
     if reasons:
         return ("ask", name, "; ".join(reasons))
     return ("allow", name, "")
+
+
+def _strict(result):
+    """Upgrade 'ask' -> 'deny' when strict mode is enabled in config."""
+    if result and result[0] == "ask" and _CONFIG.get("strict"):
+        return ("deny", result[1])
+    return result
 
 
 def emit(decision, reason):
@@ -1343,25 +1573,25 @@ def main():
             emit(decision, reason)
 
         # Rule 6: git disaster (instant, no network)
-        git_result = check_git_disaster(command)
+        git_result = _strict(check_git_disaster(command))
         if git_result:
             decision, reason = git_result
             emit(decision, reason)
 
         # Rule 7: cloud/infra blast radius (instant, no network)
-        cloud_result = check_cloud_infra(command)
+        cloud_result = _strict(check_cloud_infra(command))
         if cloud_result:
             decision, reason = cloud_result
             emit(decision, reason)
 
         # Rule 5: curl/wget piped into shell (instant, no network)
-        pipe_result = check_curl_pipe_shell(command)
+        pipe_result = _strict(check_curl_pipe_shell(command))
         if pipe_result:
             decision, reason = pipe_result
             emit(decision, reason)
 
         # Rule 8: secrets exfiltration (instant, no network)
-        exfil_result = check_secrets_exfil(command)
+        exfil_result = _strict(check_secrets_exfil(command))
         if exfil_result:
             decision, reason = exfil_result
             emit(decision, reason)
