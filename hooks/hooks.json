@@ -7,7 +7,7 @@
           {
             "type": "command",
             "timeout": 12,
-            "command": "( python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/slopguard.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/slopguard.py\" ) 2>/dev/null || true"
+            "command": "( python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/failsafe.py\" || python \"${CLAUDE_PLUGIN_ROOT}/hooks/failsafe.py\" ) 2>/dev/null || true"
           }
         ]
       }

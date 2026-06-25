@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-SlopGuard - Claude Code PreToolUse hook
+FailSafe - Claude Code PreToolUse hook
 -----------------------------------------------------------------------
-Blocks the agent from installing packages that do not exist on the
-official registry (the #1 sign of an AI "hallucinated" package), and
-warns on suspicious look-alikes. This defends against "slopsquatting":
-attackers pre-register package names that LLMs commonly invent, then
-ship malware to whoever installs them on the AI's suggestion.
+The zero-config agent seatbelt for Claude Code. Blocks dangerous agent
+actions even in --dangerously-skip-permissions (bypass) mode, where a
+hook deny is the only safety layer that still fires.
 
-Scope: inspects packages passed as direct arguments to an install
-command (npm/pnpm/yarn/bun add|install, pip/uv/poetry install|add).
-It does NOT yet inspect manifest installs (bare `npm install`,
-`pip install -r`, `poetry install`, `uv sync`) or one-off runners
-(npx/dlx/bunx).
+Current rules:
+  1. Slopsquatting defense - blocks installs of non-existent packages
+     (AI hallucinated names attackers pre-register with malware).
+  2. Destructive rm - blocks rm -rf on root, home, and system dirs.
 
 Design rules:
-  - FAIL OPEN. Any network/parse/unexpected error -> allow the install.
-    A security tool that breaks your workflow gets uninstalled.
-  - FAST PATH. Non-install Bash commands return instantly, no network.
-  - CONSERVATIVE. Only "does not exist" hard-blocks (deny). Everything
-    fuzzy (new + low downloads, look-alike) only escalates (ask).
+  - FAIL OPEN. Any unexpected error -> allow. A guard that breaks your
+    workflow gets uninstalled.
+  - FAST PATH. Non-relevant commands return instantly, no network.
+  - CONSERVATIVE. Only near-certain danger hard-blocks. Fuzzy signals
+    only escalate to a prompt.
 
 Stdlib only -> zero install. Works wherever Python 3.8+ is present.
 """
@@ -91,7 +88,7 @@ PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --------------------------------------------------------------- HTTP
 def http_get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "slopguard/0.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "failsafe/0.3"})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             status = getattr(r, "status", 200)
@@ -132,6 +129,21 @@ def strip_prefix(tokens):
     return tokens[i:]
 
 
+def split_segments(toks):
+    """Split a token list into segments on shell control operators."""
+    segments, cur = [], []
+    for t in toks:
+        if t in OPERATORS:
+            if cur:
+                segments.append(cur)
+                cur = []
+        else:
+            cur.append(t)
+    if cur:
+        segments.append(cur)
+    return segments
+
+
 def collect_js(args, targets, value_flags):
     skip_next = False
     for a in args:
@@ -170,26 +182,17 @@ def collect_py(args, targets, value_flags):
             targets.append(("pypi", name))
 
 
-def parse_install_targets(command, _depth=0):
+def tokenize(command):
     try:
-        toks = shlex.split(command, posix=True)  # quote-aware
+        return shlex.split(command, posix=True)
     except ValueError:
-        toks = command.split()
+        return command.split()
 
-    # Split the token stream into segments on shell control operators.
-    segments, cur = [], []
-    for t in toks:
-        if t in OPERATORS:
-            if cur:
-                segments.append(cur)
-                cur = []
-        else:
-            cur.append(t)
-    if cur:
-        segments.append(cur)
 
+def parse_install_targets(command, _depth=0):
+    toks = tokenize(command)
     targets = []
-    for tokens in segments:
+    for tokens in split_segments(toks):
         tokens = strip_prefix(tokens)
         if len(tokens) < 2:
             continue
@@ -224,6 +227,114 @@ def parse_install_targets(command, _depth=0):
                 collect_js(rest[1:], targets, NPM_VALUE_FLAGS)
             continue
     return targets
+
+
+# ---------------------------------------- destructive command check
+
+# Matches any rm flag combination that includes -r or -R
+_RM_RECURSIVE_RE = re.compile(r"^-[a-zA-Z]*[rR][a-zA-Z]*$")
+
+# Paths that are dangerous at the top level (rm -rf on these = catastrophe)
+_SYSTEM_ROOTS = frozenset({
+    "/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/lib32",
+    "/boot", "/sys", "/proc", "/dev", "/opt", "/root", "/var", "/snap",
+    "/run", "/srv",
+})
+
+# Home-dir aliases that mean "delete my entire home"
+_HOME_ALIASES = frozenset({"~", "$HOME", "${HOME}"})
+
+
+def _path_is_dangerous(path):
+    """Return a short description of why this path is dangerous, or None."""
+    # Trailing slash does not change what you delete; keep "/" itself intact
+    p = path.rstrip("/") or "/"
+
+    if p == "/":
+        return "the filesystem root (/)"
+
+    if p in _HOME_ALIASES:
+        return "your entire home directory (%s)" % p
+
+    # ~/  with nothing meaningful after it (e.g. "~/" or "~/.")
+    if re.match(r"^~/?\.?$", p):
+        return "your entire home directory (~)"
+
+    # Glob at root or home root: /* or ~/* or $HOME/*
+    if p in {"/*", "~/*", "$HOME/*", "${HOME}/*"}:
+        return "everything under %s" % p.rstrip("*")
+
+    # Top-level system directories
+    if p in _SYSTEM_ROOTS:
+        return "a critical system directory (%s)" % p
+
+    # /home or /home/<user> (one level: wipes a whole user account)
+    if p == "/home":
+        return "all user home directories (/home)"
+    if re.match(r"^/home/[^/]+$", p):
+        return "a user's entire home directory (%s)" % p
+
+    # /home/<user>/* - glob that empties a home dir
+    if re.match(r"^/home/[^/]+/\*$", p):
+        return "everything in a home directory (%s)" % p
+
+    return None
+
+
+def check_destructive_rm(command, _depth=0):
+    """Return (decision, reason) if command contains a dangerous rm, else None."""
+    toks = tokenize(command)
+
+    for tokens in split_segments(toks):
+        tokens = strip_prefix(tokens)
+        if not tokens:
+            continue
+
+        cmd = tokens[0]
+
+        # Recurse into bash -c "rm -rf ..."
+        if cmd in SHELLS and _depth < 2:
+            for t in tokens[1:]:
+                if " " in t:
+                    result = check_destructive_rm(t, _depth + 1)
+                    if result:
+                        return result
+            continue
+
+        if cmd != "rm":
+            continue
+
+        # Parse flags and paths from rm arguments
+        has_recursive = False
+        paths = []
+        end_of_flags = False
+
+        for t in tokens[1:]:
+            if end_of_flags:
+                paths.append(t)
+                continue
+            if t == "--":
+                end_of_flags = True
+                continue
+            if t.startswith("-") and len(t) > 1:
+                if _RM_RECURSIVE_RE.match(t):
+                    has_recursive = True
+            else:
+                paths.append(t)
+
+        if not has_recursive:
+            continue
+
+        for path in paths:
+            why = _path_is_dangerous(path)
+            if why:
+                return ("deny",
+                    "FailSafe blocked a destructive command:\n\n"
+                    "  rm -rf %s\n\n"
+                    "This would permanently delete %s. "
+                    "If you are certain this is correct, run it yourself outside the agent." % (path, why))
+
+    return None
 
 
 # ----------------------------------------------------- registry lookups
@@ -353,6 +464,13 @@ def main():
         if not command or not isinstance(command, str):
             return
 
+        # Rule 2: destructive rm (instant, no network)
+        rm_result = check_destructive_rm(command)
+        if rm_result:
+            decision, reason = rm_result
+            emit(decision, reason)
+
+        # Rule 1: slopsquatting (registry lookups)
         targets = parse_install_targets(command)
         seen, uniq = set(), []
         for t in targets:
@@ -371,7 +489,7 @@ def main():
         if denies:
             listing = "\n".join("  - %s: %s" % (n, r) for n, r in denies)
             emit("deny",
-                 "SlopGuard blocked this install:\n%s\n\n"
+                 "FailSafe blocked this install:\n%s\n\n"
                  "AI assistants sometimes invent package names that don't exist; attackers "
                  "pre-register those names with malware (\"slopsquatting\"). Verify the correct "
                  "name on the official registry before installing. If you're certain it's "
@@ -379,7 +497,7 @@ def main():
         if asks:
             listing = "\n".join("  - %s: %s" % (n, r) for n, r in asks)
             emit("ask",
-                 "SlopGuard flagged a possibly suspicious package:\n%s\n\n"
+                 "FailSafe flagged a possibly suspicious package:\n%s\n\n"
                  "Review before installing." % listing)
     except Exception:
         pass  # fail open

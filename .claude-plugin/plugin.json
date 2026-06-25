@@ -1,7 +1,7 @@
 {
-  "name": "slopguard",
-  "description": "Blocks installs of non-existent / AI-hallucinated packages before they reach your machine. Defends against 'slopsquatting' supply-chain attacks by checking every npm/pip install against the official registry. Runs automatically as a PreToolUse hook.",
-  "version": "0.1.0",
+  "name": "failsafe",
+  "description": "The zero-config agent seatbelt for Claude Code. Blocks dangerous agent actions - hallucinated package installs, destructive commands, and more - even in --dangerously-skip-permissions mode.",
+  "version": "0.3.0",
   "author": {
     "name": "Mohamed Azahrioui"
   },
