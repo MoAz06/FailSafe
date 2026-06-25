@@ -89,6 +89,20 @@ WRAPPERS = {"env", "sudo", "doas", "command", "time", "nice", "exec", "xargs"}
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 OPERATORS = {"&&", "||", ";", "|", "&", "|&"}
 
+WRAPPER_VALUE_FLAGS = {
+    "sudo": {
+        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+        "-C", "--close-from", "-T", "--command-timeout", "-D", "--chdir",
+    },
+    "doas": {"-u", "--user"},
+    "env": {
+        "-u", "--unset", "-C", "--chdir", "-S", "--split-string",
+        "--block-signal", "--default-signal", "--ignore-signal",
+    },
+    "time": {"-o", "--output", "-f", "--format"},
+    "nice": {"-n", "--adjustment"},
+}
+
 NPM_NAME_RE = re.compile(r"^(@[a-z0-9\-~][a-z0-9\-._~]*/)?[a-z0-9\-~][a-z0-9\-._~]*$", re.I)
 PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -128,11 +142,42 @@ def is_js_local_or_url(a):
             or a.startswith(".") or a.endswith(".tgz") or a.endswith(".tar.gz"))
 
 
+def _consume_wrapper_options(tokens, i, wrapper):
+    """Skip common wrapper flags so sudo -n rm ... still exposes rm."""
+    value_flags = WRAPPER_VALUE_FLAGS.get(wrapper, set())
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--":
+            return i + 1
+        if ENV_ASSIGN_RE.match(t):
+            i += 1
+            continue
+        if not t.startswith("-") or t == "-":
+            return i
+
+        takes_value = t in value_flags
+        has_inline_value = any(t.startswith(flag + "=") for flag in value_flags)
+        has_short_inline_value = len(t) > 2 and t[:2] in value_flags
+
+        i += 1
+        if takes_value and not has_inline_value and not has_short_inline_value and i < len(tokens):
+            i += 1
+    return i
+
+
 def strip_prefix(tokens):
     """Drop leading env assignments and wrappers: env FOO=bar sudo npm ..."""
     i = 0
-    while i < len(tokens) and (tokens[i] in WRAPPERS or ENV_ASSIGN_RE.match(tokens[i])):
-        i += 1
+    while i < len(tokens):
+        if ENV_ASSIGN_RE.match(tokens[i]):
+            i += 1
+            continue
+        if tokens[i] in WRAPPERS:
+            wrapper = tokens[i]
+            i += 1
+            i = _consume_wrapper_options(tokens, i, wrapper)
+            continue
+        break
     return tokens[i:]
 
 
@@ -249,7 +294,9 @@ def collect_py(args, targets, value_flags):
 
 def tokenize(command):
     try:
-        return shlex.split(command, posix=True)
+        lex = shlex.shlex(command, posix=True, punctuation_chars="|&;")
+        lex.whitespace_split = True
+        return list(lex)
     except ValueError:
         return command.split()
 
@@ -328,6 +375,8 @@ _SYSTEM_ROOTS = frozenset({
 # Home-dir aliases that mean "delete my entire home"
 _HOME_ALIASES = frozenset({"~", "$HOME", "${HOME}"})
 
+_ROOT_GLOB_SUFFIXES = ("/*", "/**", "/{*,.*}")
+
 
 def _path_is_dangerous(path):
     """Return a short description of why this path is dangerous, or None."""
@@ -347,6 +396,14 @@ def _path_is_dangerous(path):
     # Glob at root or home root: /* or ~/* or $HOME/*
     if p in {"/*", "~/*", "$HOME/*", "${HOME}/*"}:
         return "everything under %s" % p.rstrip("*")
+    if p in {"~/{*,.*}", "$HOME/{*,.*}", "${HOME}/{*,.*}"}:
+        return "everything in your home directory (%s)" % p
+
+    for suffix in _ROOT_GLOB_SUFFIXES:
+        if p.endswith(suffix):
+            base = p[:-len(suffix)]
+            if base in _SYSTEM_ROOTS:
+                return "everything in a critical system directory (%s)" % p
 
     # Top-level system directories
     if p in _SYSTEM_ROOTS:
@@ -360,6 +417,8 @@ def _path_is_dangerous(path):
 
     # /home/<user>/* - glob that empties a home dir
     if re.match(r"^/home/[^/]+/\*$", p):
+        return "everything in a home directory (%s)" % p
+    if re.match(r"^/home/[^/]+/\{\*,\.\*\}$", p):
         return "everything in a home directory (%s)" % p
 
     return None

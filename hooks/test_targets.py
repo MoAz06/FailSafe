@@ -14,6 +14,9 @@ cases = [
     ("pip install one", "pip install reqeusts", [("pypi", "reqeusts")]),
     ("python -m pip", "python -m pip install urllib3", [("pypi", "urllib3")]),
     ("bash nested install", 'bash -c "npm install loadsh"', [("npm", "loadsh")]),
+    ("semicolon no spaces", "npm install express;rm -rf /", [("npm", "express")]),
+    ("and no spaces", "npm install express&&rm -rf /", [("npm", "express")]),
+    ("pip semicolon no spaces", "pip install requests;rm -rf /", [("pypi", "requests")]),
     # --- module 3: one-off runners ---
     ("npx first arg only", "npx cowsay hello", [("npm", "cowsay")]),
     ("npx yes version", "npx -y prettier@latest --write .", [("npm", "prettier")]),
@@ -30,6 +33,7 @@ cases = [
     ("bun x alias", "bun x cowsay hello", [("npm", "cowsay")]),
     ("yarn dlx", "yarn dlx create-react-app my-app", [("npm", "create-react-app")]),
     ("bash nested runner", 'bash -c "npx cowsay hi"', [("npm", "cowsay")]),
+    ("npx and no spaces", "npx cowsay&&rm -rf /", [("npm", "cowsay")]),
     # --- should ignore local paths / runner args ---
     ("npx local path", "npx ./scripts/tool.js arg", []),
     ("pnpm dlx local path", "pnpm dlx ../tool arg", []),

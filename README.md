@@ -16,14 +16,14 @@ FailSafe runs as a `PreToolUse` hook. A hook deny still fires in bypass mode. Th
 | :-- | :-- |
 | Package **does not exist** on npm / PyPI | Deny - almost always a hallucination |
 | Exists, but **one edit away** from a popular package (e.g. `expres` vs `express`, `loadsh` vs `lodash`) | Ask - possible typosquat or look-alike |
-| Exists, but **published < 90 days ago** with **< 100 downloads/month** | Ask - suspiciously fresh |
+| npm package exists, but was **published < 90 days ago** with **< 100 downloads/month** | Ask - suspiciously fresh |
 | Everything else | Allow (silent, no slowdown) |
 
 **Destructive commands (module 2)**
 
 | Situation | Action |
 | :-- | :-- |
-| `rm -rf` on `/`, `~`, `$HOME`, `/etc`, `/usr`, `/home/<user>`, or any top-level system directory | Deny |
+| `rm -rf` on `/`, `~`, `$HOME`, `/etc`, `/usr`, `/home/<user>`, root-level system directories, or their root globs | Deny |
 | `rm -rf` on relative paths, `/tmp/...`, or deep subdirectories | Allow |
 
 **One-off runners (module 3)**
@@ -73,13 +73,14 @@ echo '{"tool_name":"Bash","tool_input":{"command":"npm install totally-not-a-rea
 
 FailSafe inspects packages passed as **direct arguments** to install commands and one-off runners:
 
-`npm install|i|add` · `pnpm add|install|i` · `yarn add` · `bun add|install|i` ·
-`pip install` · `pip3 install` · `python -m pip install` · `poetry add` ·
-`uv add` · `uv pip install` · `npx` · `npm exec|x` · `pnpm dlx` · `bunx` ·
-`bun x` · `yarn dlx`
+`npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`,
+`pip install`, `pip3 install`, `python -m pip install`, `poetry add`,
+`uv add`, `uv pip install`, `npx`, `npm exec|x`, `pnpm dlx`, `bunx`,
+`bun x`, `yarn dlx`
 
-It handles quoted names, `env FOO=bar` prefixes, wrappers (`sudo`, `env`), and
-`bash -c "..."` inner commands. Local paths, git URLs, `.tgz`/`.whl`, and lockfile installs (`npm ci`) are ignored.
+It handles quoted names, shell operators such as `;` and `&&`, `env FOO=bar`
+prefixes, common wrapper flags (`sudo -n`, `env -i`, `time -p`), and `bash -c "..."`
+inner commands. Local paths, git URLs, `.tgz`/`.whl`, and lockfile installs (`npm ci`) are ignored.
 
 **Not yet inspected:**
 - Manifest installs: bare `npm install`, `pip install -r`, `poetry install`, `uv sync`.
@@ -99,6 +100,7 @@ PreToolUse hook  ->  parse the Bash command for install / runner intents
 
 - Direct arguments only. Manifest installs and deeply embedded runner command strings are not inspected yet.
 - npm and PyPI only today. Cargo, Go modules, RubyGems, Maven are next.
+- PyPI checks cover existence and look-alikes. npm also gets package age and monthly download checks.
 - The look-alike list is a small curated set of popular packages.
 - Existence check trusts the registry. It does not score package reputation the way Socket/Snyk do - it is a free, zero-config first line of defense, not a full SCA.
 
