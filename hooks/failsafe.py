@@ -106,6 +106,16 @@ PUBLIC_GO_DOMAINS = frozenset({
     "github.com", "gitlab.com", "bitbucket.org",
     "golang.org", "google.golang.org", "k8s.io", "sigs.k8s.io", "gopkg.in",
 })
+POPULAR_GEMS = {
+    "rails", "rake", "bundler", "rspec", "rspec-core", "minitest",
+    "nokogiri", "activerecord", "activesupport", "actionpack", "actionview",
+    "devise", "sidekiq", "puma", "unicorn", "sinatra", "jekyll",
+    "capybara", "factory_bot", "faker", "rubocop", "fastlane", "cocoapods",
+    "httparty", "rest-client", "faraday", "redis", "pg", "sqlite3",
+    "mongoid", "whenever", "capistrano", "rack", "thor", "zeitwerk",
+    "dry-validation", "sorbet", "aws-sdk", "json", "openssl", "net-http",
+    "pry", "byebug", "rexml", "csv", "benchmark", "logger",
+}
 
 JS_MANAGERS = {
     "npm": {"install", "i", "add"},
@@ -120,6 +130,13 @@ CARGO_VALUE_FLAGS = frozenset({
 })
 _CARGO_NON_REGISTRY = frozenset({"--git", "--path"})
 CARGO_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
+GEM_VALUE_FLAGS = frozenset({
+    "--version", "-v", "--source", "-s", "--install-dir", "-i",
+    "--bindir", "-n", "--document", "--platform", "-P",
+    "--proxy", "--build", "--trust-policy",
+})
+GEM_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+LOW_GEM_DOWNLOADS = 1000  # total lifetime downloads threshold
 
 # Options whose NEXT token is a value, not a package (prevents false positives
 # like `pip install --platform win_amd64 requests` denying "win_amd64").
@@ -382,6 +399,25 @@ def collect_go(args, targets):
         targets.append(("go", mod))
 
 
+def collect_gems(args, targets):
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in GEM_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if any(a.startswith(f + "=") for f in GEM_VALUE_FLAGS):
+            continue
+        if a.startswith("-"):
+            continue
+        if "/" in a or a.endswith(".gem"):
+            continue  # local file path
+        if GEM_NAME_RE.match(a):
+            targets.append(("rubygems", a))
+
+
 def tokenize(command):
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars="|&;")
@@ -451,6 +487,16 @@ def parse_install_targets(command, _depth=0):
         if mgr == "go":
             if rest and rest[0] in ("get", "install"):
                 collect_go(rest[1:], targets)
+            continue
+
+        if mgr == "gem":
+            if rest and rest[0] == "install":
+                collect_gems(rest[1:], targets)
+            continue
+
+        if mgr == "bundle":
+            if rest and rest[0] == "add":
+                collect_gems(rest[1:], targets)
             continue
 
         if mgr in JS_MANAGERS:
@@ -1469,6 +1515,25 @@ def check_go(module):
         return {"exists": None}
 
 
+def check_rubygems(name):
+    req = urllib.request.Request(
+        "https://rubygems.org/api/v1/gems/" + urllib.parse.quote(name, safe="") + ".json",
+        headers={"User-Agent": "failsafe/0.9"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
+            if getattr(r, "status", 200) != 200:
+                return {"exists": None}
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return {"exists": False} if e.code == 404 else {"exists": None}
+    except Exception:
+        return {"exists": None}
+    downloads = data.get("downloads")
+    created_str = data.get("first_release_created_at") or data.get("version_created_at")
+    return {"exists": True, "age_days": age_days(parse_dt(created_str)), "downloads": downloads}
+
+
 # --------------------------------------------------- look-alike check
 def damerau_levenshtein(a, b):
     """Optimal string alignment: counts an adjacent transposition as 1."""
@@ -1514,6 +1579,8 @@ def evaluate(target):
         info, registry, popular = check_cargo(name), "crates.io", POPULAR_CARGO
     elif ecosystem == "go":
         info, registry, popular = check_go(name), "the Go module proxy", set()
+    elif ecosystem == "rubygems":
+        info, registry, popular = check_rubygems(name), "RubyGems", POPULAR_GEMS
     else:
         return ("allow", name, "")
 
@@ -1527,7 +1594,7 @@ def evaluate(target):
         look = nearest_popular(name.lower(), popular)
         if look:
             reasons.append('one character away from the popular package "%s" (possible look-alike)' % look)
-    dl_threshold = LOW_CARGO_DOWNLOADS if ecosystem == "cargo" else LOW_DOWNLOADS
+    dl_threshold = {"cargo": LOW_CARGO_DOWNLOADS, "rubygems": LOW_GEM_DOWNLOADS}.get(ecosystem, LOW_DOWNLOADS)
     if (info.get("age_days") is not None and info["age_days"] < NEW_PACKAGE_DAYS
             and info.get("downloads") is not None and info["downloads"] < dl_threshold):
         reasons.append("first published %d days ago with only ~%d downloads"
