@@ -219,7 +219,7 @@ PreToolUse hook  ->  parse the Bash command
 
 **One-off runners:** `npx`, `npm exec|x`, `pnpm dlx`, `bunx`, `bun x`, `yarn dlx`
 
-**Manifest/lockfiles on bare install:** `package.json`, `package-lock.json` (npm ci), `yarn.lock`, `requirements.txt`, `pyproject.toml`, `poetry.lock`
+**Manifest/lockfiles on bare install:** `package.json`, `package-lock.json` v2/v3 (npm ci), `yarn.lock` v1, `requirements.txt`, `pyproject.toml`, `poetry.lock`
 
 Handles: quoted names, `;` and `&&` operators, `env FOO=bar` prefixes, wrapper flags (`sudo -n`, `env -i`, `time -p`), `bash -c "..."` inner commands.
 
