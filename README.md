@@ -20,7 +20,7 @@ official registry and **blocks the install if the package doesn't exist** — ev
 | Situation | Action |
 | :-- | :-- |
 | Package **does not exist** on npm / PyPI | 🛑 **Deny** — almost always a hallucination |
-| Exists, but **1 character** from a popular package (e.g. `expres` → `express`) | ⚠️ **Ask** — possible typosquat/look-alike |
+| Exists, but **one edit** from a popular package — typo or letter swap (e.g. `expres`→`express`, `loadsh`→`lodash`) | ⚠️ **Ask** — possible typosquat/look-alike |
 | Exists, but **published < 90 days ago** with **< 100 downloads/month** | ⚠️ **Ask** — suspiciously fresh |
 | Everything else | ✅ Allow (silent, no slowdown) |
 
@@ -53,14 +53,22 @@ echo '{"tool_name":"Bash","tool_input":{"command":"npm install totally-not-a-rea
   | python hooks/slopguard.py
 ```
 
-## Supported install commands
+## Scope: what it checks
+
+SlopGuard inspects packages passed as **direct arguments** to an install command:
 
 `npm install|i|add` · `pnpm add|install|i` · `yarn add` · `bun add|install|i` ·
 `pip install` · `pip3 install` · `python -m pip install` · `poetry add` ·
 `uv add` · `uv pip install`
 
-Local paths, git URLs, `.tgz`/`.tar.gz`, `-r requirements.txt`, and lockfile installs
-(`npm ci`) are ignored — those names are already pinned or local.
+It is robust to quoted names, `env FOO=bar` prefixes, wrappers (`sudo`, `env`), and
+`bash -c "..."` wrappers. Local paths, git URLs, `.tgz`/`.whl`, `-r requirements.txt`
+arguments, and lockfile installs (`npm ci`) are ignored — those are pinned or local.
+
+**Not yet inspected** (so a hallucinated name here still slips through):
+- Manifest installs that read names from a file: bare `npm install`, `pip install -r`,
+  `poetry install`, `uv sync`.
+- One-off runners: `npx`, `pnpm dlx`, `bunx`, `npm exec`.
 
 ## How it works
 
@@ -74,10 +82,14 @@ PreToolUse hook  ──▶  parse the Bash command for install intents
 
 ## Limitations (and roadmap)
 
+- **Direct arguments only.** Manifest installs (`npm install` from `package.json`,
+  `pip install -r`, `poetry install`, `uv sync`) and one-off runners (`npx`, `dlx`, `bunx`)
+  are not inspected yet. Scanning manifests before install is the top roadmap item.
 - **npm + PyPI only** today. Cargo, Go modules, RubyGems, Maven are next.
-- The "suspicious look-alike" list is a small curated set of popular packages — expanding it
-  (and pulling live download stats) would catch more typosquats.
-- Doesn't yet inspect `npx`/`pnpm dlx` one-off runs.
+- The look-alike list is a small curated set of popular packages — expanding it would catch
+  more typosquats. The new+low-download signal uses live download counts for npm (incl.
+  scoped); PyPI download counts are not exposed by the registry API, so that signal is
+  npm-only for now.
 - Existence check trusts the registry; it doesn't (yet) score package *reputation* the way
   Socket/Snyk do — it's a free, zero-config first line of defense, not a full SCA.
 

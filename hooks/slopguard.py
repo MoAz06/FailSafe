@@ -8,18 +8,25 @@ warns on suspicious look-alikes. This defends against "slopsquatting":
 attackers pre-register package names that LLMs commonly invent, then
 ship malware to whoever installs them on the AI's suggestion.
 
+Scope: inspects packages passed as direct arguments to an install
+command (npm/pnpm/yarn/bun add|install, pip/uv/poetry install|add).
+It does NOT yet inspect manifest installs (bare `npm install`,
+`pip install -r`, `poetry install`, `uv sync`) or one-off runners
+(npx/dlx/bunx).
+
 Design rules:
   - FAIL OPEN. Any network/parse/unexpected error -> allow the install.
     A security tool that breaks your workflow gets uninstalled.
   - FAST PATH. Non-install Bash commands return instantly, no network.
   - CONSERVATIVE. Only "does not exist" hard-blocks (deny). Everything
-    fuzzy (new + low downloads, 1-char look-alike) only escalates (ask).
+    fuzzy (new + low downloads, look-alike) only escalates (ask).
 
 Stdlib only -> zero install. Works wherever Python 3.8+ is present.
 """
 
 import json
 import re
+import shlex
 import sys
 import urllib.request
 import urllib.error
@@ -30,6 +37,7 @@ from datetime import datetime, timezone
 REQUEST_TIMEOUT = 3.5
 NEW_PACKAGE_DAYS = 90
 LOW_DOWNLOADS = 100
+MAX_PACKAGES = 25  # beyond this, fail open rather than stall the agent
 
 POPULAR_NPM = {
     "react", "react-dom", "react-router-dom", "lodash", "express", "axios",
@@ -55,7 +63,27 @@ JS_MANAGERS = {
     "yarn": {"add"},
     "bun": {"add", "install", "i"},
 }
-PY_FILE_FLAGS = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable"}
+
+# Options whose NEXT token is a value, not a package (prevents false positives
+# like `pip install --platform win_amd64 requests` denying "win_amd64").
+PIP_VALUE_FLAGS = {
+    "-r", "--requirement", "-c", "--constraint", "-e", "--editable",
+    "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+    "--platform", "--python-version", "--implementation", "--abi",
+    "-t", "--target", "--prefix", "--root", "--no-binary", "--only-binary",
+    "--progress-bar", "--report", "--hash", "--cache-dir", "--log", "--python",
+}
+UV_VALUE_FLAGS = PIP_VALUE_FLAGS | {"--index", "--default-index", "--index-strategy", "-p"}
+POETRY_VALUE_FLAGS = {"--group", "-G", "--source", "--extras", "-E", "--python", "--platform"}
+NPM_VALUE_FLAGS = {
+    "--registry", "--prefix", "-C", "--workspace", "-w", "--save-prefix",
+    "--omit", "--include", "--tag", "--access", "--otp", "--loglevel", "--cache",
+}
+
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+WRAPPERS = {"env", "sudo", "doas", "command", "time", "nice", "exec", "xargs"}
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+OPERATORS = {"&&", "||", ";", "|", "&", "|&"}
 
 NPM_NAME_RE = re.compile(r"^(@[a-z0-9\-~][a-z0-9\-._~]*/)?[a-z0-9\-~][a-z0-9\-._~]*$", re.I)
 PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -63,7 +91,7 @@ PY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --------------------------------------------------------------- HTTP
 def http_get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "slopguard/0.1"})
+    req = urllib.request.Request(url, headers={"User-Agent": "slopguard/0.2"})
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             status = getattr(r, "status", 200)
@@ -77,10 +105,6 @@ def http_get_json(url):
 
 
 # ----------------------------------------------------- command parsing
-def split_segments(command):
-    return [s.strip() for s in re.split(r"&&|\|\||;|\|", command) if s.strip()]
-
-
 def strip_npm_version(arg):
     if arg.startswith("@"):
         i = arg.find("@", 1)
@@ -100,60 +124,104 @@ def is_js_local_or_url(a):
             or a.startswith(".") or a.endswith(".tgz") or a.endswith(".tar.gz"))
 
 
-def collect_js(args, targets):
+def strip_prefix(tokens):
+    """Drop leading env assignments and wrappers: env FOO=bar sudo npm ..."""
+    i = 0
+    while i < len(tokens) and (tokens[i] in WRAPPERS or ENV_ASSIGN_RE.match(tokens[i])):
+        i += 1
+    return tokens[i:]
+
+
+def collect_js(args, targets, value_flags):
+    skip_next = False
     for a in args:
-        if a.startswith("-") or is_js_local_or_url(a):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in value_flags:
+            skip_next = True
+            continue
+        if a.startswith("-") or a in (".", ".."):
+            continue
+        if is_js_local_or_url(a):
             continue
         name = strip_npm_version(a)
         if name and not name.startswith("-") and NPM_NAME_RE.match(name):
             targets.append(("npm", name))
 
 
-def collect_py(args, targets):
+def collect_py(args, targets, value_flags):
     skip_next = False
     for a in args:
         if skip_next:
             skip_next = False
             continue
-        if a in PY_FILE_FLAGS:
-            skip_next = True  # next token is a file/path
+        if a in value_flags:
+            skip_next = True  # next token is a value, not a package
             continue
-        if a.startswith("-") or "/" in a or "\\" in a or "://" in a:
+        if a.startswith("-") or a in (".", ".."):
             continue
-        if re.search(r"\.(txt|cfg|toml|ini)$", a, re.I):
+        if "/" in a or "\\" in a or "://" in a:
+            continue
+        if re.search(r"\.(txt|cfg|toml|ini|whl|zip)$", a, re.I) or a.endswith(".tar.gz"):
             continue
         name = strip_py_version(a)
         if name and not name.startswith("-") and PY_NAME_RE.match(name):
             targets.append(("pypi", name))
 
 
-def parse_install_targets(command):
+def parse_install_targets(command, _depth=0):
+    try:
+        toks = shlex.split(command, posix=True)  # quote-aware
+    except ValueError:
+        toks = command.split()
+
+    # Split the token stream into segments on shell control operators.
+    segments, cur = [], []
+    for t in toks:
+        if t in OPERATORS:
+            if cur:
+                segments.append(cur)
+                cur = []
+        else:
+            cur.append(t)
+    if cur:
+        segments.append(cur)
+
     targets = []
-    for seg in split_segments(command):
-        tokens = seg.split()
+    for tokens in segments:
+        tokens = strip_prefix(tokens)
         if len(tokens) < 2:
             continue
         mgr, rest = tokens[0], tokens[1:]
 
+        # Recurse into shell wrappers: bash -c "npm install x"
+        if mgr in SHELLS and _depth < 2:
+            for t in rest:
+                if " " in t:  # a quoted inner command
+                    targets.extend(parse_install_targets(t, _depth + 1))
+            continue
+
         if mgr in ("python", "python3") and len(rest) >= 2 and rest[0] == "-m" and rest[1] == "pip":
             mgr, rest = "pip", rest[2:]
+
         if mgr == "uv":
             if len(rest) >= 2 and rest[0] == "pip" and rest[1] == "install":
-                collect_py(rest[2:], targets)
+                collect_py(rest[2:], targets, UV_VALUE_FLAGS)
             elif rest and rest[0] == "add":
-                collect_py(rest[1:], targets)
+                collect_py(rest[1:], targets, UV_VALUE_FLAGS)
             continue
         if mgr == "poetry":
             if rest and rest[0] == "add":
-                collect_py(rest[1:], targets)
+                collect_py(rest[1:], targets, POETRY_VALUE_FLAGS)
             continue
         if mgr in ("pip", "pip3"):
             if rest and rest[0] == "install":
-                collect_py(rest[1:], targets)
+                collect_py(rest[1:], targets, PIP_VALUE_FLAGS)
             continue
         if mgr in JS_MANAGERS:
             if rest and rest[0] in JS_MANAGERS[mgr]:
-                collect_js(rest[1:], targets)
+                collect_js(rest[1:], targets, NPM_VALUE_FLAGS)
             continue
     return targets
 
@@ -175,19 +243,21 @@ def age_days(dt):
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
 
 
+def npm_encode(name):
+    return name.replace("/", "%2F") if name.startswith("@") else urllib.parse.quote(name)
+
+
 def check_npm(name):
-    enc = name.replace("/", "%2F") if name.startswith("@") else urllib.parse.quote(name)
-    status, data = http_get_json("https://registry.npmjs.org/" + enc)
+    status, data = http_get_json("https://registry.npmjs.org/" + npm_encode(name))
     if status == 404:
         return {"exists": False}
     if not data:
         return {"exists": None}
     created = parse_dt((data.get("time") or {}).get("created"))
     downloads = None
-    if not name.startswith("@"):
-        _, dd = http_get_json("https://api.npmjs.org/downloads/point/last-month/" + urllib.parse.quote(name))
-        if dd and isinstance(dd.get("downloads"), int):
-            downloads = dd["downloads"]
+    _, dd = http_get_json("https://api.npmjs.org/downloads/point/last-month/" + npm_encode(name))
+    if dd and isinstance(dd.get("downloads"), int):
+        downloads = dd["downloads"]
     return {"exists": True, "age_days": age_days(created), "downloads": downloads}
 
 
@@ -207,23 +277,30 @@ def check_pypi(name):
 
 
 # --------------------------------------------------- look-alike check
-def levenshtein(a, b):
+def damerau_levenshtein(a, b):
+    """Optimal string alignment: counts an adjacent transposition as 1."""
     m, n = len(a), len(b)
     if abs(m - n) > 1:
         return 2  # we only care about distance <= 1
-    dp = list(range(n + 1))
+    d = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        d[i][0] = i
+    for j in range(n + 1):
+        d[0][j] = j
     for i in range(1, m + 1):
-        prev, dp[0] = dp[0], i
         for j in range(1, n + 1):
-            prev, dp[j] = dp[j], min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] != b[j - 1]))
-    return dp[n]
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[m][n]
 
 
 def nearest_popular(name, popular):
     if name in popular:
         return None
     for p in popular:
-        if levenshtein(name, p) == 1:
+        if damerau_levenshtein(name, p) == 1:
             return p
     return None
 
@@ -277,14 +354,13 @@ def main():
             return
 
         targets = parse_install_targets(command)
-        # de-dup
         seen, uniq = set(), []
         for t in targets:
             if t not in seen:
                 seen.add(t)
                 uniq.append(t)
-        if not uniq:
-            return  # fast path: nothing to install
+        if not uniq or len(uniq) > MAX_PACKAGES:
+            return  # fast path / too many to check quickly -> fail open
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             results = list(ex.map(evaluate, uniq))
