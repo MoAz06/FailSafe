@@ -15,6 +15,14 @@ Current rules:
   4. Manifest install defense - reads package.json/requirements.txt/
      pyproject.toml on bare installs so a hallucinated dep hidden in a
      manifest is caught too.
+  5. Curl-pipe-shell guard - blocks/flags remote scripts piped directly
+     into a shell or interpreter (curl ... | bash, wget ... | python).
+  6. Git disaster guard - blocks/flags force pushes to protected branches,
+     hard resets, force cleans, and force branch deletions.
+  7. Cloud/infra blast radius - flags terraform destroy, kubectl delete
+     namespace, docker system prune -a, aws s3 rm --recursive, etc.
+  8. Secrets exfiltration guard - flags sensitive files (.env, ~/.ssh,
+     keys) piped or sent to network commands.
 
 Design rules:
   - FAIL OPEN. Any unexpected error -> allow. A guard that breaks your
@@ -382,7 +390,7 @@ MAX_MANIFEST_BYTES = 512 * 1024  # don't slurp a giant generated file
 
 # npm bare-install verbs (no positional package => install from package.json)
 JS_INSTALL_VERBS = {
-    "npm": {"install", "i", "ci"},
+    "npm": {"install", "i"},
     "pnpm": {"install", "i"},
     "yarn": {"install"},
     "bun": {"install", "i"},
@@ -425,8 +433,16 @@ def _parse_package_json(text):
         for name, spec in section.items():
             if not isinstance(name, str):
                 continue
-            if isinstance(spec, str) and spec.lower().startswith(_JS_SKIP_SPEC_PREFIXES):
-                continue  # local path, git, url, or workspace alias
+            if isinstance(spec, str):
+                sl = spec.lower()
+                if sl.startswith(_JS_SKIP_SPEC_PREFIXES):
+                    continue  # local path, git, url, or workspace alias
+                # npm alias: "alias": "npm:real-pkg@version" — check real pkg
+                if sl.startswith("npm:"):
+                    real = strip_npm_version(spec[4:])
+                    if real and NPM_NAME_RE.match(real):
+                        targets.append(("npm", real))
+                    continue
             if NPM_NAME_RE.match(name):
                 targets.append(("npm", name))
     return targets
@@ -522,16 +538,14 @@ def _requirement_files(args, cwd):
     files, i = [], 0
     while i < len(args):
         a = args[i]
-        if a in ("-r", "--requirement", "-c", "--constraint"):
+        if a in ("-r", "--requirement"):
             if i + 1 < len(args):
                 files.append(_abs(args[i + 1], cwd))
                 i += 2
                 continue
-        elif a.startswith("--requirement=") or a.startswith("--constraint="):
+        elif a.startswith("--requirement="):
             files.append(_abs(a.split("=", 1)[1], cwd))
         elif a.startswith("-r") and len(a) > 2:
-            files.append(_abs(a[2:], cwd))
-        elif a.startswith("-c") and len(a) > 2:
             files.append(_abs(a[2:], cwd))
         i += 1
     return files
@@ -607,9 +621,20 @@ _SYSTEM_ROOTS = frozenset({
 })
 
 # Home-dir aliases that mean "delete my entire home"
-_HOME_ALIASES = frozenset({"~", "$HOME", "${HOME}"})
+_HOME_ALIASES = frozenset({"~", "$HOME", "${HOME}", "$USERPROFILE", "${USERPROFILE}"})
 
 _ROOT_GLOB_SUFFIXES = ("/*", "/**", "/{*,.*}")
+
+# Git Bash maps Windows drives to /c/, /d/, etc. (single lowercase letter).
+_WIN_DRIVE_RE = re.compile(r"^/([a-z])(/.*)?$", re.I)
+_WIN_SYSTEM_SUBDIRS = frozenset({
+    "windows", "program files", "program files (x86)", "programdata",
+})
+# Windows env vars for system dirs (Git Bash expands these as $VAR)
+_WIN_ENV_SYSTEM = frozenset({
+    "$systemroot", "${systemroot}", "$windir", "${windir}",
+    "$programfiles", "${programfiles}",
+})
 
 
 def _path_is_dangerous(path):
@@ -654,6 +679,34 @@ def _path_is_dangerous(path):
         return "everything in a home directory (%s)" % p
     if re.match(r"^/home/[^/]+/\{\*,\.\*\}$", p):
         return "everything in a home directory (%s)" % p
+
+    # Repository metadata - wipes entire git history
+    if p == ".git":
+        return "the repository's git history (.git)"
+
+    # Windows env var system dirs (Git Bash: $WINDIR, $SYSTEMROOT, $PROGRAMFILES)
+    if p.lower() in _WIN_ENV_SYSTEM:
+        return "a critical Windows system directory (%s)" % p
+
+    # Git Bash Windows drive paths: /c = C:\, /c/Windows = C:\Windows, etc.
+    m = _WIN_DRIVE_RE.match(p)
+    if m:
+        drive = m.group(1).upper()
+        rest = (m.group(2) or "").strip("/")
+        if not rest:
+            return "the Windows %s:\\ drive root" % drive
+        parts = [x for x in rest.split("/") if x]
+        top = parts[0].lower()
+        if top == "users":
+            if len(parts) == 1:
+                return "all Windows user home directories (%s:\\Users)" % drive
+            sub = parts[1]
+            if sub == "*":
+                return "all Windows user home directories (%s:\\Users\\*)" % drive
+            if len(parts) == 2:
+                return "a Windows user's entire home directory (%s:\\Users\\%s)" % (drive, sub)
+        if top in _WIN_SYSTEM_SUBDIRS:
+            return "a critical Windows system directory (%s:\\%s)" % (drive, parts[0])
 
     return None
 
@@ -710,6 +763,401 @@ def check_destructive_rm(command, _depth=0):
                     "  rm -rf %s\n\n"
                     "This would permanently delete %s. "
                     "If you are certain this is correct, run it yourself outside the agent." % (path, why))
+
+    return None
+
+
+# ------------------------------------------ curl-pipe-shell guard
+
+_FETCHERS = frozenset({"curl", "wget", "fetch", "aria2c", "http", "lwp-download"})
+_PIPE_EXECUTORS = frozenset({
+    "bash", "sh", "zsh", "dash", "ksh",
+    "python", "python3", "ruby", "perl", "node", "nodejs",
+})
+
+
+def _segments_with_ops(toks):
+    """Like split_segments but preserves the connecting operator per segment."""
+    result, cur, op = [], [], None
+    for t in toks:
+        if t in OPERATORS:
+            if cur:
+                result.append((op, cur))
+            cur, op = [], t
+        else:
+            cur.append(t)
+    if cur:
+        result.append((op, cur))
+    return result
+
+
+def _fetcher_url(args):
+    for a in args:
+        if a.startswith("http://") or a.startswith("https://"):
+            return a
+    return None
+
+
+def check_curl_pipe_shell(command, _depth=0):
+    """Return (decision, reason) if command pipes a remote fetch into a shell."""
+    toks = tokenize(command)
+    segs = _segments_with_ops(toks)
+
+    for i, (_, seg) in enumerate(segs):
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] not in _FETCHERS:
+            continue
+        if i + 1 >= len(segs):
+            continue
+        next_op, next_seg = segs[i + 1]
+        if next_op != "|":
+            continue
+        next_s = strip_prefix(next_seg)
+        if not next_s or next_s[0] not in _PIPE_EXECUTORS:
+            continue
+
+        fetcher, executor = seg_s[0], next_s[0]
+        url = _fetcher_url(seg_s[1:])
+
+        if url and url.startswith("http://"):
+            return ("deny",
+                "FailSafe blocked a remote script over plain HTTP:\n\n"
+                "  %s ... | %s\n\n"
+                "Fetching over unencrypted HTTP lets a network attacker intercept "
+                "and replace the script before it runs. "
+                "If you need this script, switch to HTTPS and inspect it first." % (fetcher, executor))
+
+        return ("ask",
+            "FailSafe flagged a remote script execution:\n\n"
+            "  %s ... | %s\n\n"
+            "This downloads and immediately executes remote code without inspection. "
+            "Review the script source before running it." % (fetcher, executor))
+
+    if _depth < 2:
+        for _, seg in segs:
+            seg_s = strip_prefix(seg)
+            if seg_s and seg_s[0] in SHELLS:
+                for t in seg_s[1:]:
+                    if " " in t:
+                        result = check_curl_pipe_shell(t, _depth + 1)
+                        if result:
+                            return result
+    return None
+
+
+# ---------------------------------------------- git disaster guard
+
+_GIT_PROTECTED_BRANCHES = frozenset({
+    "main", "master", "production", "release", "prod", "staging",
+})
+_GIT_FORCE_FLAGS = frozenset({"--force", "-f", "--force-with-lease", "--force-if-includes"})
+_GIT_SKIP_VALUE_FLAGS = frozenset({
+    "--receive-pack", "--exec", "--repo", "-o", "--push-option",
+    "--recurse-submodules", "--signed",
+})
+
+
+def _git_push_branch(subargs):
+    """Return the destination branch from git push args, or None."""
+    skip_next = False
+    non_flag = []
+    for a in subargs:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in _GIT_SKIP_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if a.startswith("-"):
+            continue
+        non_flag.append(a)
+    # non_flag: [remote, refspec, ...]  refspec may be src:dst or branch
+    for token in non_flag[1:]:
+        dst = token.split(":")[-1].lstrip("+")
+        if dst:
+            return dst
+    return None
+
+
+def check_git_disaster(command, _depth=0):
+    """Return (decision, reason) for dangerous git operations, or None."""
+    toks = tokenize(command)
+    for tokens in split_segments(toks):
+        tokens = strip_prefix(tokens)
+        if not tokens:
+            continue
+        cmd = tokens[0]
+        if cmd in SHELLS and _depth < 2:
+            for t in tokens[1:]:
+                if " " in t:
+                    result = check_git_disaster(t, _depth + 1)
+                    if result:
+                        return result
+            continue
+        if cmd != "git":
+            continue
+
+        rest = tokens[1:]
+        # Skip global git options like -C <dir>
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("-C", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(rest):
+                i += 2
+            elif rest[i].startswith("-"):
+                i += 1
+            else:
+                break
+        if i >= len(rest):
+            continue
+        subcmd, subargs = rest[i], rest[i + 1:]
+
+        if subcmd == "reset" and ("--hard" in subargs or "--merge" in subargs):
+            mode = "--hard" if "--hard" in subargs else "--merge"
+            return ("ask",
+                "FailSafe flagged a potentially destructive git operation:\n\n"
+                "  git reset %s\n\n"
+                "This discards all uncommitted changes and cannot be undone. "
+                "Confirm this is intentional." % " ".join(subargs))
+
+        if subcmd == "clean":
+            flags_combined = "".join(
+                a[1:] for a in subargs if re.match(r"^-[a-zA-Z]+$", a)
+            )
+            if "f" in flags_combined and "n" not in flags_combined:
+                return ("ask",
+                    "FailSafe flagged a potentially destructive git operation:\n\n"
+                    "  git clean %s\n\n"
+                    "This permanently deletes untracked files and cannot be undone. "
+                    "Confirm this is intentional." % " ".join(subargs))
+
+        if subcmd == "push":
+            force_flags = [a for a in subargs if a in _GIT_FORCE_FLAGS
+                           or a.startswith("--force-with-lease=")]
+            if force_flags:
+                branch = _git_push_branch(subargs)
+                if branch and branch.lower() in _GIT_PROTECTED_BRANCHES:
+                    return ("deny",
+                        "FailSafe blocked a force push to a protected branch:\n\n"
+                        "  git push %s\n\n"
+                        "Force pushing to '%s' permanently overwrites remote history "
+                        "and affects all collaborators. "
+                        "If you are certain, run this yourself outside the agent." % (
+                            " ".join(subargs), branch))
+                return ("ask",
+                    "FailSafe flagged a force push:\n\n"
+                    "  git push %s\n\n"
+                    "Force pushing rewrites remote history. "
+                    "Confirm the target branch and that this is intentional." % " ".join(subargs))
+
+        if subcmd == "branch":
+            flags = [a for a in subargs if a.startswith("-")]
+            branches = [a for a in subargs if not a.startswith("-")]
+            flag_chars = "".join(a[1:] for a in flags if re.match(r"^-[a-zA-Z]+$", a))
+            long_flags = set(flags)
+            is_force_delete = (
+                "D" in flag_chars
+                or ("--delete" in long_flags and ("--force" in long_flags or "f" in flag_chars))
+                or ("-d" in flags and ("--force" in long_flags or "f" in flag_chars))
+            )
+            if is_force_delete and branches:
+                return ("ask",
+                    "FailSafe flagged a force branch deletion:\n\n"
+                    "  git branch -D %s\n\n"
+                    "This deletes the branch even if it has unmerged commits. "
+                    "Confirm this is intentional." % " ".join(branches))
+
+    return None
+
+
+# ------------------------------------------ cloud / infra blast-radius guard
+
+_CLOUD_ASK_TMPL = (
+    "FailSafe flagged a potentially destructive infrastructure command:\n\n"
+    "  %s\n\n"
+    "%s\n\n"
+    "Confirm this is intentional before proceeding."
+)
+
+
+def check_cloud_infra(command, _depth=0):
+    """Return (decision, reason) for high-blast-radius cloud/infra commands."""
+    toks = tokenize(command)
+    for tokens in split_segments(toks):
+        tokens = strip_prefix(tokens)
+        if not tokens:
+            continue
+        cmd = tokens[0]
+        if cmd in SHELLS and _depth < 2:
+            for t in tokens[1:]:
+                if " " in t:
+                    result = check_cloud_infra(t, _depth + 1)
+                    if result:
+                        return result
+            continue
+        rest = tokens[1:]
+
+        if cmd == "terraform" and rest and rest[0] == "destroy":
+            return ("ask", _CLOUD_ASK_TMPL % (
+                "terraform destroy",
+                "This tears down all infrastructure managed by this Terraform workspace."))
+
+        if cmd == "kubectl" and rest and rest[0] == "delete":
+            args = rest[1:]
+            frag = "kubectl delete " + " ".join(args)
+            if any(a in ("namespace", "ns") for a in args):
+                return ("ask", _CLOUD_ASK_TMPL % (
+                    frag, "This deletes an entire Kubernetes namespace and every resource in it."))
+            if "--all" in args or "-A" in args or "--all-namespaces" in args:
+                return ("ask", _CLOUD_ASK_TMPL % (
+                    frag, "This deletes all matching Kubernetes resources."))
+
+        if cmd == "docker":
+            if (len(rest) >= 2 and rest[0] == "system" and rest[1] == "prune"
+                    and ("--all" in rest or "-a" in rest)):
+                return ("ask", _CLOUD_ASK_TMPL % (
+                    "docker system prune -a",
+                    "This removes all unused images, containers, networks, and build cache."))
+            if len(rest) >= 2 and rest[0] == "volume" and rest[1] in ("rm", "remove"):
+                return ("ask", _CLOUD_ASK_TMPL % (
+                    "docker volume rm " + " ".join(rest[2:]),
+                    "This permanently removes Docker volumes and their stored data."))
+
+        if (cmd == "aws" and len(rest) >= 2 and rest[0] == "s3"
+                and rest[1] in ("rm", "sync", "mv")
+                and ("--recursive" in rest or "--delete" in rest)):
+            return ("ask", _CLOUD_ASK_TMPL % (
+                "aws s3 " + " ".join(rest[1:]),
+                "This recursively deletes or overwrites S3 objects and cannot be undone."))
+
+        if cmd == "gcloud" and len(rest) >= 2 and rest[0] == "projects" and rest[1] == "delete":
+            return ("ask", _CLOUD_ASK_TMPL % (
+                "gcloud projects delete " + " ".join(rest[2:]),
+                "This schedules a GCP project for deletion, removing all its resources."))
+
+        if cmd == "az" and len(rest) >= 2 and rest[0] == "group" and rest[1] == "delete":
+            return ("ask", _CLOUD_ASK_TMPL % (
+                "az group delete " + " ".join(rest[2:]),
+                "This deletes an Azure resource group and all resources inside it."))
+
+    return None
+
+
+# ------------------------------------------ secrets exfiltration guard
+
+_SENSITIVE_RE = [
+    re.compile(r"(^|[\\/])\.env(\.[a-zA-Z]+)?$"),
+    re.compile(r"(^|[\\/])\.ssh[\\/]"),
+    re.compile(r"\.(pem|key|p12|pfx|crt|cer|jks)$", re.I),
+    re.compile(r"(^|[\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(\.pub)?$"),
+    re.compile(r"(^|[\\/])(\.netrc|\.npmrc|\.pypirc)$"),
+    re.compile(r"(^|[\\/])\.aws[\\/]credentials$"),
+]
+
+_NETWORK_SENDERS = frozenset({
+    "curl", "wget", "scp", "rsync", "nc", "netcat", "ncat", "socat",
+    "ftp", "sftp", "aws", "gcloud", "gsutil",
+})
+_FILE_READERS = frozenset({"cat", "head", "tail", "tee"})
+_CURL_DATA_FLAGS = frozenset({
+    "-d", "--data", "--data-binary", "--data-raw", "--data-ascii",
+    "--data-urlencode", "-F", "--form", "--upload-file", "-T",
+})
+
+
+def _is_sensitive(path):
+    for pat in _SENSITIVE_RE:
+        if pat.search(path):
+            return True
+    return False
+
+
+def _curl_sensitive_file(args):
+    """Return sensitive filename if curl is reading one via @file or -T."""
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in _CURL_DATA_FLAGS:
+            skip_next = True
+            if i + 1 < len(args):
+                val = args[i + 1]
+                # -F name=@file  or  -d @file
+                f = val.split("=@", 1)[1] if "=@" in val else val.lstrip("@")
+                if _is_sensitive(f):
+                    return f
+            continue
+        if "=" in a:
+            key, _, val = a.partition("=")
+            if key in _CURL_DATA_FLAGS:
+                val = val.lstrip("@")
+                if _is_sensitive(val):
+                    return val
+    return None
+
+
+def check_secrets_exfil(command, _depth=0):
+    """Return (decision, reason) if command appears to leak sensitive files."""
+    toks = tokenize(command)
+    segs = _segments_with_ops(toks)
+
+    # Pattern 1: cat/head/tail <sensitive> | <network_cmd>
+    for i, (_, seg) in enumerate(segs):
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] not in _FILE_READERS:
+            continue
+        sensitive = [a for a in seg_s[1:] if not a.startswith("-") and _is_sensitive(a)]
+        if not sensitive:
+            continue
+        for j in range(i + 1, len(segs)):
+            jop, jseg = segs[j]
+            if jop != "|":
+                break
+            jseg_s = strip_prefix(jseg)
+            if jseg_s and jseg_s[0] in _NETWORK_SENDERS:
+                return ("ask",
+                    "FailSafe flagged a possible secrets leak:\n\n"
+                    "  %s\n\n"
+                    "A sensitive file (%s) is being piped into a network command. "
+                    "Confirm this is intentional." % (" ".join(toks), sensitive[0]))
+
+    # Pattern 2: curl/wget -d @<sensitive>
+    for _, seg in segs:
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] not in {"curl", "wget", "http"}:
+            continue
+        f = _curl_sensitive_file(seg_s[1:])
+        if f:
+            return ("ask",
+                "FailSafe flagged a possible secrets leak:\n\n"
+                "  %s\n\n"
+                "A sensitive file (%s) is being sent to a remote server. "
+                "Confirm this is intentional." % (" ".join(toks), f))
+
+    # Pattern 3: scp/rsync <sensitive> <remote:path>
+    for _, seg in segs:
+        seg_s = strip_prefix(seg)
+        if not seg_s or seg_s[0] not in {"scp", "rsync"}:
+            continue
+        non_flags = [a for a in seg_s[1:] if not a.startswith("-")]
+        if len(non_flags) >= 2:
+            src, dst = non_flags[0], non_flags[-1]
+            if ":" in dst and _is_sensitive(src):
+                return ("ask",
+                    "FailSafe flagged a possible secrets leak:\n\n"
+                    "  %s\n\n"
+                    "A sensitive file (%s) is being copied to a remote destination. "
+                    "Confirm this is intentional." % (" ".join(toks), src))
+
+    if _depth < 2:
+        for _, seg in segs:
+            seg_s = strip_prefix(seg)
+            if seg_s and seg_s[0] in SHELLS:
+                for t in seg_s[1:]:
+                    if " " in t:
+                        result = check_secrets_exfil(t, _depth + 1)
+                        if result:
+                            return result
 
     return None
 
@@ -849,6 +1297,30 @@ def main():
         rm_result = check_destructive_rm(command)
         if rm_result:
             decision, reason = rm_result
+            emit(decision, reason)
+
+        # Rule 6: git disaster (instant, no network)
+        git_result = check_git_disaster(command)
+        if git_result:
+            decision, reason = git_result
+            emit(decision, reason)
+
+        # Rule 7: cloud/infra blast radius (instant, no network)
+        cloud_result = check_cloud_infra(command)
+        if cloud_result:
+            decision, reason = cloud_result
+            emit(decision, reason)
+
+        # Rule 5: curl/wget piped into shell (instant, no network)
+        pipe_result = check_curl_pipe_shell(command)
+        if pipe_result:
+            decision, reason = pipe_result
+            emit(decision, reason)
+
+        # Rule 8: secrets exfiltration (instant, no network)
+        exfil_result = check_secrets_exfil(command)
+        if exfil_result:
+            decision, reason = exfil_result
             emit(decision, reason)
 
         # Rules 1 + 3 + 4: slopsquatting / one-off runners / manifest installs
