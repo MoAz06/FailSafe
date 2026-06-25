@@ -78,8 +78,8 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 
 | Situation | Action |
 | :-- | :-- |
-| `git push --force` to `main`, `master`, `production`, `release`, `prod`, `staging` | Deny |
-| `git push --force` to any other branch, or `--force-with-lease` | Ask |
+| `git push --force` / `git push origin +main` to `main`, `master`, `production`, `release`, `prod`, `staging` | Deny |
+| `git push --force` / `+refspec` to any other branch, or `--force-with-lease` | Ask |
 | `git reset --hard` or `--merge` | Ask |
 | `git clean -f` / `-fd` / `-fdx` (without dry-run) | Ask |
 | `git branch -D <branch>` | Ask |
@@ -105,6 +105,8 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 | `cat .env \| curl` / `cat ~/.ssh/id_rsa \| nc` | Ask |
 | `curl -d @.env https://...` / `curl -F file=@.env` | Ask |
 | `scp .env user@host:.` / `rsync .env user@host:` | Ask |
+| `tar czf - ~/.ssh \| curl --data-binary @- https://...` | Ask |
+| `aws s3 cp .env s3://bucket` / `aws s3 mv id_rsa s3://...` | Ask |
 | Reading `.env` locally without network | Allow |
 
 Sensitive file patterns: `.env`, `.env.*`, `~/.ssh/*`, `*.pem`, `*.key`, `*.p12`, `id_rsa`, `id_ed25519`, `.netrc`, `.npmrc`, `.aws/credentials`.
