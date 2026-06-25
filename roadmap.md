@@ -201,7 +201,31 @@ Success looks like:
 - Teams can tune FailSafe without forking it.
 - Solo developers can install it and forget it.
 
-## Priority 8: More Ecosystems
+## Priority 8: Codex CLI Support
+
+Codex (OpenAI's open-source terminal agent) uses an identical hook architecture:
+PreToolUse fires before shell commands, stdin delivers JSON, and returning
+`permissionDecision: "deny"` blocks the action. Config lives in `hooks.json`
+or `~/.codex/config.toml`.
+
+`failsafe.py` likely needs zero changes. Work needed:
+
+- Install Codex CLI and compare exact stdin JSON format with Claude Code's.
+- If identical: add a `codex-hooks.json` (or confirm one `hooks.json` works for both).
+- If different: write a thin adapter that normalizes the input before passing to `failsafe.py`.
+- Add Codex-specific end-to-end tests.
+- Update README install instructions for both agents.
+
+Known limitation: Codex's own docs say PreToolUse "doesn't intercept all shell
+calls yet, only the simple ones" — coverage will be lower than Claude Code until
+Codex matures.
+
+Success looks like:
+
+- One `failsafe.py`, two agents protected.
+- Install instructions for Claude Code and Codex side by side.
+
+## Priority 9: More Ecosystems
 
 Add registries only when the parser and reputation checks can stay simple.
 
