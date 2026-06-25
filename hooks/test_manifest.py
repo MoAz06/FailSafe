@@ -22,7 +22,8 @@ PACKAGE_JSON = """{
     "@scope/thing": "^2.0.0",
     "local-dep": "file:../local",
     "git-dep": "git+https://example.com/x.git",
-    "ws-dep": "workspace:*"
+    "ws-dep": "workspace:*",
+    "lodash": "npm:loadsh@1.0.0"
   },
   "devDependencies": {
     "jest": "^29.0.0"
@@ -97,14 +98,15 @@ with tempfile.TemporaryDirectory() as d:
     write(d, "package.json", PACKAGE_JSON)
     write(d, "requirements.txt", REQUIREMENTS)
 
+    # loadsh is the real pkg in npm alias "lodash": "npm:loadsh@1.0.0"
     expect_pkg = [("npm", "express"), ("npm", "reqeusts-fake"),
-                  ("npm", "@scope/thing"), ("npm", "jest")]
+                  ("npm", "@scope/thing"), ("npm", "jest"), ("npm", "loadsh")]
     check("npm install -> package.json",
           parse_manifest_targets("npm install", d), expect_pkg)
     check("npm i (alias)",
           parse_manifest_targets("npm i", d), expect_pkg)
-    check("npm ci",
-          parse_manifest_targets("npm ci", d), expect_pkg)
+    check("npm ci -> nothing (uses lockfile, not package.json)",
+          parse_manifest_targets("npm ci", d), [])
     check("pnpm install",
           parse_manifest_targets("pnpm install", d), expect_pkg)
     check("yarn (bare)",
@@ -126,6 +128,8 @@ with tempfile.TemporaryDirectory() as d:
           parse_manifest_targets("uv pip install -r requirements.txt", d), expect_req)
     check("pip install (no -r) -> nothing",
           parse_manifest_targets("pip install", d), [])
+    check("pip install -c constraints.txt -> nothing (constraints not install targets)",
+          parse_manifest_targets("pip install -c requirements.txt", d), [])
 
     # bash-nested + chained
     check("bash -c nested npm install",
