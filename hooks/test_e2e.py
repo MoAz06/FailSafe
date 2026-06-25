@@ -148,6 +148,15 @@ check("go get fake module -> deny",         d, r, "deny",  "not found")
 d, r = run_hook("go get github.com/gin-gonic/gin@latest")
 check("go get real module -> allow",        d, r, None)
 
+d, r = run_hook("gem install totally-fake-failsafe-gem-xyz987")
+check("gem install fake gem -> deny",       d, r, "deny",  "not found")
+
+d, r = run_hook("gem install rails")
+check("gem install real gem -> allow",      d, r, None)
+
+d, r = run_hook("bundle add totally-fake-failsafe-gem-xyz987")
+check("bundle add fake gem -> deny",        d, r, "deny",  "not found")
+
 # --- Module 6: Git disaster ---
 print("\n=== Module 6: Git disaster ===")
 d, r = run_hook("git push origin main --force")
