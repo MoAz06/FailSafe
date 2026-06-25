@@ -10,19 +10,30 @@ FailSafe runs as a `PreToolUse` hook. **A hook deny still fires in bypass mode.*
 
 ## Install
 
+**From PyPI:**
+
+```bash
+pip install failsafe-hook
+python -m failsafe_hook --install
+```
+
+**From source:**
+
 ```bash
 git clone https://github.com/MoAz06/FailSafe.git
 cd FailSafe
 python install.py
 ```
 
+`install.py` runs `pip install -e .` automatically if needed, then wires the hook.
+
 That's it. FailSafe now runs automatically on every Claude Code session, including bypass mode.
 
 **Check status / uninstall:**
 
 ```bash
-python install.py --check
-python install.py --uninstall
+python -m failsafe_hook --check
+python -m failsafe_hook --uninstall
 ```
 
 **Requirements:** Python 3.8+ on your PATH. No other dependencies.

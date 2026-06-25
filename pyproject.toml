@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "failsafe-hook"
+version = "1.0.0"
+description = "Zero-config agent seatbelt for Claude Code"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Mohamed Azahrioui", email = "mohamedazahrioui2006@gmail.com"}]
+
+[project.urls]
+Homepage = "https://github.com/MoAz06/FailSafe"
+"Bug Tracker" = "https://github.com/MoAz06/FailSafe/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
