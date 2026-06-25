@@ -32,9 +32,9 @@ AI assistants hallucinate package names. Attackers pre-register those names with
 
 | Situation | Action |
 | :-- | :-- |
-| Package **does not exist** on npm / PyPI / crates.io / Go proxy | Deny |
+| Package **does not exist** on npm / PyPI / crates.io / RubyGems / Go proxy | Deny |
 | Exists but **one edit away** from a popular package (`expres` vs `express`) | Ask |
-| Package exists but **< 90 days old** with **< 100 downloads/month** (npm/PyPI) or **< 500 recent downloads** (Cargo) | Ask |
+| Package exists but **< 90 days old** with **< 100 downloads/month** (npm/PyPI), **< 500** (Cargo), **< 1 000** total (RubyGems) | Ask |
 | Everything else | Allow (silent) |
 
 **Module 2 -- Destructive commands**
@@ -111,15 +111,18 @@ A bare install pulls every dependency from a manifest file. An agent can inject 
 
 Sensitive file patterns: `.env`, `.env.*`, `~/.ssh/*`, `*.pem`, `*.key`, `*.p12`, `id_rsa`, `id_ed25519`, `.netrc`, `.npmrc`, `.aws/credentials`.
 
-**Module 9 -- Cargo and Go modules**
+**Module 9 -- Cargo, Go, and RubyGems**
 
 | Situation | Action |
 | :-- | :-- |
 | `cargo add` / `cargo install` -- crate not found on crates.io | Deny |
-| Crate one character away from a popular crate (`serde_jso` vs `serde_json`) | Ask |
+| Crate one edit away from a popular crate (`serde_jso` vs `serde_json`) | Ask |
 | Crate < 90 days old with < 500 recent downloads | Ask |
 | `go get` / `go install` -- module not found on the Go module proxy | Deny |
-| `--git` or `--path` sources | Ignored (not registry installs) |
+| `gem install` / `bundle add` -- gem not found on RubyGems | Deny |
+| Gem one edit away from a popular gem (`railss` vs `rails`) | Ask |
+| Gem < 90 days old with < 1 000 total downloads | Ask |
+| `--git`, `--path`, or local `.gem` file sources | Ignored (not registry installs) |
 | Private/unknown Go module domains | Ignored (avoids false positives) |
 
 **Configuration (`failsafe.toml`)**
@@ -215,7 +218,7 @@ PreToolUse hook  ->  parse the Bash command
 
 ## Scope: what it checks
 
-**Install commands:** `npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`, `pip install`, `pip3 install`, `python -m pip install`, `poetry add`, `uv add`, `uv pip install`, `cargo add`, `cargo install`, `go get`, `go install`
+**Install commands:** `npm install|i|add`, `pnpm add|install|i`, `yarn add`, `bun add|install|i`, `pip install`, `pip3 install`, `python -m pip install`, `poetry add`, `uv add`, `uv pip install`, `cargo add`, `cargo install`, `go get`, `go install`, `gem install`, `bundle add`
 
 **One-off runners:** `npx`, `npm exec|x`, `pnpm dlx`, `bunx`, `bun x`, `yarn dlx`
 
@@ -229,7 +232,7 @@ Ignores: local paths, git URLs, `.tgz`/`.whl` files.
 
 ## Limitations
 
-- npm, PyPI, crates.io, and Go proxy. RubyGems, Maven are next.
+- npm, PyPI, crates.io, RubyGems, and Go proxy. Maven is next.
 - Look-alike detection uses a curated list of popular packages, not a full corpus.
 - `pnpm-lock.yaml` not inspected (no stdlib YAML parser).
 - Deeply embedded runner command strings are not inspected (`npm exec -c "eslint ."`).
@@ -245,7 +248,7 @@ To add a new rule:
 2. Wire it into `main()` before the registry lookups (if it needs no network) or after (if it does).
 3. Add a `hooks/test_<name>.py` with PASS/FAIL cases following the existing pattern.
 4. Add an e2e case to `hooks/test_e2e.py`.
-5. Run all tests: all existing 244+ cases must still pass.
+5. Run all tests: all existing 265+ cases must still pass.
 
 To add a new package ecosystem:
 
